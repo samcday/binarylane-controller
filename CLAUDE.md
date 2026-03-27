@@ -17,8 +17,8 @@ cargo clippy --workspace --locked   # lint
 cargo fmt --all -- --check          # format check
 cargo test --workspace --locked     # test
 cargo build --release               # release build
-cargo xtask dev                     # local dev with kind + bacon auto-reload
-cargo xtask tilt                    # in-cluster dev with Tilt + Helm
+cargo xtask dev-up                  # provision/reuse remote BinaryLane k3s control plane
+cargo xtask dev-down                # tear down remote BinaryLane dev control plane
 ```
 
 ## Architecture
@@ -32,7 +32,7 @@ src/autoscaler.rs            gRPC CloudProvider: manages node groups, creates/de
 proto/externalgrpc.proto     Cluster autoscaler external gRPC proto definition
 build.rs                     Compiles proto via tonic-build + protobuf-src
 chart/                       Helm chart for deployment
-xtask/                       Dev workflow automation (kind, tilt, bacon)
+xtask/                       Dev workflow automation (remote k3s dev control plane)
 ```
 
 ### Key concepts

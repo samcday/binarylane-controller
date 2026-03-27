@@ -31,3 +31,19 @@ docker run -e BL_API_TOKEN=<your-token> binarylane-controller
 | `CLOUD_INIT_PATH` | no | `/etc/binarylane-controller/cloud-init.sh` | Cloud-init template file |
 | `GRPC_LISTEN_ADDR` | no | `:8086` | gRPC listen address |
 | `TMPL_*` | no | | Extra variables passed into the cloud-init template |
+
+## Remote dev control plane
+
+Use xtask to provision/reuse a BinaryLane k3s control-plane VM and emit sourceable env vars:
+
+```bash
+eval "$(cargo xtask dev-up)"
+```
+
+`dev-up` writes local state to `.dev/dev-state.json` and kubeconfig to `.dev/kubeconfig`, logs progress to stderr, and prints shell assignments to stdout (including `KUBECONFIG`, `BL_DEV_*`, and `TMPL_*` values).
+
+Tear down all tracked dev resources and local state:
+
+```bash
+cargo xtask dev-down
+```
