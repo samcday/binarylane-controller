@@ -4,45 +4,54 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-A Kubernetes cloud provider controller for BinaryLane (Australian VPS provider). Two responsibilities:
+A Kubernetes cloud provider controller for BinaryLane (Australian VPS provider). Three responsibilities:
 1. **Node controller** - reconciles K8s nodes with BinaryLane servers (syncs addresses/labels/taints, removes nodes for deleted servers)
-2. **Autoscaler gRPC provider** - implements the K8s cluster-autoscaler external gRPC CloudProvider interface to scale node groups
+2. **Service controller** - manages LoadBalancer-type services by creating/updating/deleting BinaryLane load balancers
+3. **Autoscaler gRPC provider** - implements the K8s cluster-autoscaler external gRPC CloudProvider interface to scale node groups
 
 ## Build & Run
 
 ```bash
-go build -o binarylane-controller .          # build
-docker build -t binarylane-controller .      # container build
-buf generate                                 # regenerate proto stubs (requires protoc-gen-go, protoc-gen-go-grpc)
+cargo check --workspace --locked    # type check
+cargo clippy --workspace --locked   # lint
+cargo fmt --all -- --check          # format check
+cargo test --workspace --locked     # test
+cargo build --release               # release build
+cargo xtask dev                     # local dev with kind + bacon auto-reload
+cargo xtask tilt                    # in-cluster dev with Tilt + Helm
 ```
-
-No tests exist yet. No CI/CD is configured.
 
 ## Architecture
 
 ```
-main.go                        Entry point: inits BL client, starts node controller + optional gRPC autoscaler
-binarylane/client.go           REST client for BinaryLane v2 API (Get/List/Create/Delete servers)
-nodecontroller/controller.go   30s reconciliation loop over all K8s nodes with binarylane:/// provider IDs
-autoscaler/provider.go         gRPC CloudProvider: manages node groups, creates/deletes servers, cloud-init templating
-proto/                         externalgrpc.proto + generated Go stubs (do not edit .pb.go files)
+src/main.rs                  Entry point: CLI args, starts controllers + optional gRPC autoscaler
+src/binarylane.rs            REST client for BinaryLane v2 API (servers + load balancers)
+src/node_controller.rs       30s reconciliation loop over K8s nodes with binarylane:/// provider IDs
+src/service_controller.rs    30s reconciliation loop for LoadBalancer services
+src/autoscaler.rs            gRPC CloudProvider: manages node groups, creates/deletes servers
+proto/externalgrpc.proto     Cluster autoscaler external gRPC proto definition
+build.rs                     Compiles proto via tonic-build + protobuf-src
+chart/                       Helm chart for deployment
+xtask/                       Dev workflow automation (kind, tilt, bacon)
 ```
 
 ### Key concepts
 
-- **Provider ID format**: `binarylane:///<serverID>` - maps K8s nodes to BinaryLane servers. See `binarylane.ServerProviderID()` / `ParseProviderID()`.
+- **Provider ID format**: `binarylane:///<serverID>` - maps K8s nodes to BinaryLane servers. See `binarylane::server_provider_id()` / `parse_provider_id()`.
 - **Server ownership**: autoscaler identifies managed servers by name prefix (`<namePrefix><groupID>-`).
-- **Cloud-init templating**: `text/template` with vars from `TMPL_*` env vars plus built-in `NodeName`, `NodeGroup`, `Region`, `Size`.
-- **Thread safety**: autoscaler server cache protected by `sync.RWMutex`.
-- **Node controller** runs unconditionally; autoscaler gRPC server only starts if config file exists.
+- **Cloud-init templating**: simple `{{.Key}}` string replacement with vars from `TMPL_*` env vars plus built-in `NodeName`, `NodeGroup`, `Region`, `Size`.
+- **Thread safety**: autoscaler server cache protected by `tokio::sync::RwLock`.
+- **Node/service controllers** run unconditionally; autoscaler gRPC server only starts if config file exists.
 
 ### Environment variables
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `BL_API_TOKEN` | yes | | BinaryLane API token |
-| `KUBECONFIG` | no | in-cluster | Path to kubeconfig |
 | `CONFIG_PATH` | no | `/etc/binarylane-controller/config.json` | Autoscaler node group config |
 | `CLOUD_INIT_PATH` | no | `/etc/binarylane-controller/cloud-init.sh` | Cloud-init template file |
-| `GRPC_LISTEN_ADDR` | no | `:8086` | gRPC listen address |
+| `GRPC_LISTEN_ADDR` | no | `0.0.0.0:8086` | gRPC listen address |
+| `TLS_CERT_PATH` | no | | TLS cert (enables mTLS when all three TLS vars set) |
+| `TLS_KEY_PATH` | no | | TLS private key |
+| `TLS_CA_PATH` | no | | TLS CA certificate |
 | `TMPL_*` | no | | Template variables for cloud-init |

@@ -1,0 +1,16 @@
+# Override values for Tilt development.
+# Set your BL_API_TOKEN here or use existingSecret.
+apiToken: "dev-token-replace-me"
+
+autoscaler:
+  enabled: false
+
+mtls:
+  enabled: false
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 256Mi

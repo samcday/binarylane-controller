@@ -1,10 +1,11 @@
-FROM golang:1.25-alpine AS build
+FROM rust:1-alpine AS build
+RUN apk add --no-cache musl-dev protobuf-dev
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN go mod tidy && CGO_ENABLED=0 go build -o /binarylane-controller .
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY proto/ proto/
+COPY src/ src/
+RUN cargo build --release
 
 FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /binarylane-controller /binarylane-controller
+COPY --from=build /src/target/release/binarylane-controller /binarylane-controller
 ENTRYPOINT ["/binarylane-controller"]
