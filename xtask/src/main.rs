@@ -19,12 +19,14 @@ const DEFAULT_STATE_FILE: &str = ".dev/dev-state.json";
 const DEFAULT_KUBECONFIG_OUT: &str = ".dev/kubeconfig";
 const DEFAULT_KNOWN_HOSTS: &str = ".dev/known_hosts";
 const DEFAULT_DOCKER_CONFIG_DIR: &str = ".dev/docker";
+const DEFAULT_TILT_VALUES_OUT: &str = ".dev/tilt-values.generated.yaml";
 const DEFAULT_REGISTRY_USERNAME: &str = "dev";
 const DEFAULT_REGISTRY_SECRET_NAME: &str = "dev-registry-cred";
 const REGISTRY_NAMESPACE: &str = "binarylane-dev-registry";
 const REGISTRY_DATA_HOSTPATH: &str = "/var/lib/binarylane-dev-registry/registry-data";
 const REGISTRY_TLS_DATA_HOSTPATH: &str = "/var/lib/binarylane-dev-registry/caddy-data";
 const REGISTRY_TLS_CONFIG_HOSTPATH: &str = "/var/lib/binarylane-dev-registry/caddy-config";
+const DEV_AUTOSCALER_GROUP_ID: &str = "workers";
 
 const DEFAULT_REGION: &str = "syd";
 const DEFAULT_SIZE: &str = "std-1vcpu";
@@ -68,6 +70,10 @@ struct DevUpArgs {
     /// Local Docker config directory containing registry auth
     #[arg(long, default_value = DEFAULT_DOCKER_CONFIG_DIR)]
     docker_config_dir: PathBuf,
+
+    /// Generated tilt values file with autoscaler + mTLS dev config
+    #[arg(long, default_value = DEFAULT_TILT_VALUES_OUT)]
+    tilt_values_out: PathBuf,
 
     /// Server name to create/reuse
     #[arg(long, default_value_t = default_server_name())]
@@ -139,6 +145,10 @@ struct DevDownArgs {
     /// Local Docker config directory to delete
     #[arg(long, default_value = DEFAULT_DOCKER_CONFIG_DIR)]
     docker_config_dir: PathBuf,
+
+    /// Generated tilt values file to delete
+    #[arg(long, default_value = DEFAULT_TILT_VALUES_OUT)]
+    tilt_values_out: PathBuf,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -160,6 +170,7 @@ struct DevState {
     registry_password: Option<String>,
     registry_pull_secret_name: String,
     docker_config_dir: Option<String>,
+    tilt_values_path: Option<String>,
     registry_image_repo: Option<String>,
     kubeconfig_path: Option<String>,
     known_hosts_path: Option<String>,
@@ -236,11 +247,13 @@ fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
     ensure_parent_dir(&args.kubeconfig_out)?;
     ensure_parent_dir(&args.known_hosts)?;
     ensure_parent_dir(&args.ssh_key_path)?;
+    ensure_parent_dir(&args.tilt_values_out)?;
     ensure_dir(&args.docker_config_dir)?;
 
     let timeout = Duration::from_secs(args.wait_timeout_secs);
     let ssh_key_path = absolute_path(&args.ssh_key_path)?;
     let docker_config_dir = absolute_path(&args.docker_config_dir)?;
+    let tilt_values_out = absolute_path(&args.tilt_values_out)?;
     ensure_dir(&docker_config_dir)?;
     ensure_managed_ssh_keypair(&ssh_key_path)?;
     let ssh_public_key = read_managed_public_key(&ssh_key_path)?;
@@ -289,6 +302,7 @@ fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
     state.ssh_key_id = Some(account_key.id);
     state.ssh_key_fingerprint = Some(account_key.fingerprint.clone());
     state.ssh_key_name = account_key.name.clone();
+    state.tilt_values_path = Some(path_to_string(&tilt_values_out)?);
     save_state(&args.state_file, &state)?;
 
     server = wait_for_server_active(&client, server.id, timeout)?;
@@ -404,6 +418,13 @@ fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
         &registry_username,
         &registry_password,
     )?;
+    write_dev_tilt_values(
+        &tilt_values_out,
+        &args,
+        &account_key.fingerprint,
+        &k3s_url,
+        &k3s_token,
+    )?;
 
     state.server_id = Some(server.id);
     state.server_name = server.name.clone();
@@ -421,6 +442,7 @@ fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
     state.registry_password = Some(registry_password.clone());
     state.registry_pull_secret_name = args.registry_secret_name.clone();
     state.docker_config_dir = Some(path_to_string(&docker_config_dir)?);
+    state.tilt_values_path = Some(path_to_string(&tilt_values_out)?);
     state.registry_image_repo = Some(registry_image_repo.clone());
     state.kubeconfig_path = Some(path_to_string(&absolute_path(&args.kubeconfig_out)?)?);
     state.known_hosts_path = Some(path_to_string(&absolute_path(&args.known_hosts)?)?);
@@ -438,6 +460,7 @@ fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
     );
     emit_env("BL_API_TOKEN", &args.bl_api_token);
     emit_env("DOCKER_CONFIG", &path_to_string(&docker_config_dir)?);
+    emit_env("BL_DEV_TILT_VALUES", &path_to_string(&tilt_values_out)?);
     emit_env("BL_DEV_SERVER_ID", &server.id.to_string());
     emit_env("BL_DEV_SERVER_NAME", &server.name);
     emit_env("BL_DEV_SERVER_IP", &server_ip);
@@ -451,6 +474,7 @@ fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
     emit_env("BL_DEV_REGISTRY_PASSWORD", &registry_password);
     emit_env("BL_DEV_REGISTRY_PULL_SECRET", &args.registry_secret_name);
     emit_env("BL_DEV_CONTROLLER_IMAGE", &registry_image_repo);
+    emit_env("BL_DEV_AUTOSCALER_GROUP", DEV_AUTOSCALER_GROUP_ID);
     emit_env("BL_DEV_K3S_URL", &k3s_url);
     emit_env("BL_DEV_K3S_TOKEN", &k3s_token);
     emit_env("TMPL_K3S_URL", &k3s_url);
@@ -498,11 +522,15 @@ fn cmd_dev_down(args: DevDownArgs) -> Result<()> {
 
     remove_file_if_exists(&args.kubeconfig_out)?;
     remove_file_if_exists(&args.known_hosts)?;
+    remove_file_if_exists(&args.tilt_values_out)?;
 
     if let Some(path) = &state.kubeconfig_path {
         remove_file_if_exists(Path::new(path))?;
     }
     if let Some(path) = &state.known_hosts_path {
+        remove_file_if_exists(Path::new(path))?;
+    }
+    if let Some(path) = &state.tilt_values_path {
         remove_file_if_exists(Path::new(path))?;
     }
     if let Some(path) = &state.ssh_key_path {
@@ -1313,6 +1341,106 @@ fn write_docker_config(
             docker_config_dir.join("config.json").display()
         )
     })
+}
+
+fn write_dev_tilt_values(
+    tilt_values_path: &Path,
+    args: &DevUpArgs,
+    ssh_key_fingerprint: &str,
+    k3s_url: &str,
+    k3s_token: &str,
+) -> Result<()> {
+    ensure_parent_dir(tilt_values_path)?;
+
+    let cloud_init = dev_worker_cloud_init_template();
+    let cloud_init_indented = indent_block(&cloud_init, 4);
+
+    let contents = format!(
+        r#"autoscaler:
+  enabled: true
+  listenAddr: "0.0.0.0:8086"
+  config:
+    namePrefix: "bl-dev-"
+    sshKeys:
+      - "{ssh_key_fingerprint}"
+    nodeGroups:
+      - id: "{group_id}"
+        minSize: 0
+        maxSize: 3
+        size: "{size}"
+        region: "{region}"
+        image: "{image}"
+        vcpus: 1
+        memoryMb: 1024
+        diskGb: 25
+        labels:
+          autoscale-group: "{group_id}"
+  cloudInit: |
+{cloud_init}
+mtls:
+  enabled: true
+templateVars:
+  K3S_URL: "{k3s_url}"
+  K3S_TOKEN: "{k3s_token}"
+"#,
+        ssh_key_fingerprint = yaml_escape(ssh_key_fingerprint),
+        group_id = DEV_AUTOSCALER_GROUP_ID,
+        size = yaml_escape(&args.size),
+        region = yaml_escape(&args.region),
+        image = yaml_escape(&args.image),
+        cloud_init = cloud_init_indented,
+        k3s_url = yaml_escape(k3s_url),
+        k3s_token = yaml_escape(k3s_token),
+    );
+
+    fs::write(tilt_values_path, contents).with_context(|| {
+        format!(
+            "writing generated tilt values {}",
+            tilt_values_path.display()
+        )
+    })
+}
+
+fn dev_worker_cloud_init_template() -> String {
+    "#!/bin/sh
+set -eu
+if command -v cloud-init >/dev/null 2>&1; then
+  cloud-init status --wait || true
+fi
+if [ \"$(id -u)\" -eq 0 ]; then
+  SUDO=\"\"
+else
+  SUDO=\"sudo\"
+fi
+if ! command -v curl >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    ${SUDO} apt-get update -y
+    ${SUDO} apt-get install -y curl
+  elif command -v dnf >/dev/null 2>&1; then
+    ${SUDO} dnf install -y curl
+  elif command -v apk >/dev/null 2>&1; then
+    ${SUDO} apk add --no-cache curl
+  fi
+fi
+if ! command -v k3s >/dev/null 2>&1; then
+  curl -sfL https://get.k3s.io | ${SUDO} env K3S_URL=\"{{.K3S_URL}}\" K3S_TOKEN=\"{{.K3S_TOKEN}}\" INSTALL_K3S_EXEC=\"agent --node-name {{.NodeName}} --node-label autoscale-group={{.NodeGroup}} --node-taint node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule\" sh -s -
+fi
+${SUDO} systemctl enable --now k3s-agent >/dev/null 2>&1 || true
+"
+    .to_string()
+}
+
+fn indent_block(block: &str, spaces: usize) -> String {
+    let indent = " ".repeat(spaces);
+    block
+        .lines()
+        .map(|line| format!("{indent}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn yaml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn generate_registry_password() -> String {

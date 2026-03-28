@@ -26,7 +26,7 @@ autoscaler:
   # Cloud-init template
   cloudInit: ""
   # gRPC listen address
-  listenAddr: ":8086"
+  listenAddr: "0.0.0.0:8086"
 
 # Template variables passed as TMPL_* env vars
 templateVars: {}

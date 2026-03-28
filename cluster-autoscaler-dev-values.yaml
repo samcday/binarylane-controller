@@ -1,0 +1,40 @@
+# Values for the official cluster-autoscaler chart in dev.
+# Connects to our controller's externalgrpc provider via mTLS.
+cloudProvider: externalgrpc
+
+# Required by the chart to render the Deployment, even though externalgrpc
+# discovers groups via gRPC. A single dummy entry is sufficient.
+autoscalingGroups:
+  - name: placeholder
+    minSize: 0
+    maxSize: 0
+
+extraArgs:
+  cloud-config: /config/cloud-config
+  scan-interval: "10s"
+  scale-down-delay-after-add: "2m"
+  scale-down-unneeded-time: "2m"
+  v: "5"
+
+extraVolumes:
+  - name: cloud-config
+    configMap:
+      name: cluster-autoscaler-cloud-config
+  - name: grpc-client-cert
+    secret:
+      secretName: binarylane-controller-mtls-client
+      defaultMode: 292
+
+extraVolumeMounts:
+  - name: cloud-config
+    mountPath: /config
+    readOnly: true
+  - name: grpc-client-cert
+    mountPath: /etc/ssl/client-cert
+    readOnly: true
+
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
