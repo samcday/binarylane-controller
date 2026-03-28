@@ -1,5 +1,5 @@
 FROM rust:1-alpine AS build
-RUN apk add --no-cache musl-dev protobuf-dev
+RUN apk add --no-cache build-base cmake musl-dev protobuf-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY xtask/ xtask/
