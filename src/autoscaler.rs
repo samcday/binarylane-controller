@@ -328,10 +328,12 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
 
             self.servers.write().await.insert(srv.id, srv.clone());
 
+            let mut labels = self.node_labels(&ng);
+            labels.insert("kubernetes.io/hostname".to_string(), name.clone());
             let node = K8sNode {
                 metadata: K8sObjectMeta {
                     name: Some(name.clone()),
-                    labels: Some(self.node_labels(&ng)),
+                    labels: Some(labels),
                     finalizers: Some(vec![crate::node_controller::FINALIZER.to_string()]),
                     ..Default::default()
                 },
@@ -487,7 +489,11 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
             .find_group(id)
             .ok_or_else(|| Status::not_found(format!("node group {id} not found")))?;
 
-        let labels = self.node_labels(ng);
+        let mut labels = self.node_labels(ng);
+        labels.insert(
+            "kubernetes.io/hostname".to_string(),
+            format!("template-{}", ng.id),
+        );
 
         let mut capacity = BTreeMap::new();
         capacity.insert(
