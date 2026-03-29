@@ -135,10 +135,7 @@ async fn main() -> Result<()> {
         .filter_map(|(k, v)| k.strip_prefix("TMPL_").map(|k| (k.to_string(), v)))
         .collect::<HashMap<_, _>>();
 
-    let pod_name =
-        std::env::var("POD_NAME").unwrap_or_else(|_| "binarylane-controller".to_string());
-    let pod_namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| "default".to_string());
-    let provider = autoscaler::Provider::new(bl, k8s.clone(), cfg.clone(), pod_name, pod_namespace);
+    let provider = autoscaler::Provider::new(bl, k8s.clone(), cfg.clone());
     let svc = proto::cloud_provider_server::CloudProviderServer::new(provider);
 
     info!(

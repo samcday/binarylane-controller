@@ -47,6 +47,19 @@ pub struct Image {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ListedImage {
+    #[allow(dead_code)]
+    pub id: i64,
+    pub slug: Option<String>,
+    #[allow(dead_code)]
+    pub name: String,
+    #[allow(dead_code)]
+    pub distribution: String,
+    #[allow(dead_code)]
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Networks {
     pub v4: Vec<NetworkV4>,
 }
@@ -192,6 +205,46 @@ impl Client {
             }
             let r: Resp = resp.json().await.context("decoding servers")?;
             all.extend(r.servers);
+            if r.links.and_then(|l| l.pages.next).is_none() {
+                break;
+            }
+            page += 1;
+        }
+        Ok(all)
+    }
+
+    pub async fn list_images(&self) -> Result<Vec<ListedImage>> {
+        let mut all = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let resp = self
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/images?page={page}&per_page=100"),
+                )
+                .send()
+                .await
+                .context("listing images")?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("listing images: {status}: {body}");
+            }
+            #[derive(Deserialize)]
+            struct Pages {
+                next: Option<String>,
+            }
+            #[derive(Deserialize)]
+            struct Links {
+                pages: Pages,
+            }
+            #[derive(Deserialize)]
+            struct Resp {
+                images: Vec<ListedImage>,
+                links: Option<Links>,
+            }
+            let r: Resp = resp.json().await.context("decoding images")?;
+            all.extend(r.images);
             if r.links.and_then(|l| l.pages.next).is_none() {
                 break;
             }

@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use k8s_openapi::api::core::v1::ObjectReference;
-use k8s_openapi::api::core::v1::{Node as K8sNode, NodeSpec as K8sNodeSpec, Taint as K8sTaint};
-use k8s_openapi::api::events::v1::Event as K8sEvent;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta as K8sObjectMeta};
+use k8s_openapi::api::core::v1::{
+    Event as K8sEvent, EventSource, Node as K8sNode, NodeSpec as K8sNodeSpec, ObjectReference,
+    Taint as K8sTaint,
+};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta as K8sObjectMeta, Time};
 use k8s_pb::api::core::v1::{Node, NodeCondition, NodeSpec, NodeStatus, Taint};
 use k8s_pb::apimachinery::pkg::api::resource::Quantity;
 use k8s_pb::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -52,25 +53,15 @@ pub struct Provider {
     bl: BlClient,
     k8s: kube::Client,
     cfg: Config,
-    pod_name: String,
-    pod_namespace: String,
     servers: Arc<RwLock<HashMap<i64, binarylane::Server>>>,
 }
 
 impl Provider {
-    pub fn new(
-        bl: BlClient,
-        k8s: kube::Client,
-        cfg: Config,
-        pod_name: String,
-        pod_namespace: String,
-    ) -> Self {
+    pub fn new(bl: BlClient, k8s: kube::Client, cfg: Config) -> Self {
         Self {
             bl,
             k8s,
             cfg,
-            pod_name,
-            pod_namespace,
             servers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -285,12 +276,27 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
             )));
         }
 
+        let images = self
+            .bl
+            .list_images()
+            .await
+            .map_err(|e| Status::internal(format!("listing images: {e}")))?;
+        if !images
+            .iter()
+            .any(|image| image.slug.as_deref() == Some(ng.image.as_str()))
+        {
+            return Err(Status::invalid_argument(format!(
+                "image slug '{}' not found in BinaryLane image list",
+                ng.image
+            )));
+        }
+
         // NOTE: if a creation fails mid-loop, already-created servers remain.
         // The autoscaler's next refresh() will pick them up, but a retry before
         // refresh could overshoot max_size. Acceptable for now since the BL API
         // will reject servers beyond account quota anyway.
         let node_api: Api<K8sNode> = Api::all(self.k8s.clone());
-        let events_api: Api<K8sEvent> = Api::namespaced(self.k8s.clone(), &self.pod_namespace);
+        let events_api: Api<K8sEvent> = Api::namespaced(self.k8s.clone(), "default");
         for i in 0..req.delta {
             let ts = chrono_like_timestamp();
             let name = format!("{}{}-{ts}-{i}", self.cfg.name_prefix, ng.id);
@@ -341,39 +347,52 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
                 }),
                 status: None,
             };
-            match node_api.create(&Default::default(), &node).await {
-                Ok(_) => info!(name = %name, id = srv.id, "pre-created k8s node"),
+            let node_uid = match node_api.create(&Default::default(), &node).await {
+                Ok(created) => {
+                    info!(name = %name, id = srv.id, "pre-created k8s node");
+                    created.metadata.uid
+                }
                 Err(kube::Error::Api(err)) if err.code == 409 => {
                     info!(name = %name, id = srv.id, "k8s node already exists");
+                    node_api.get(&name).await.ok().and_then(|n| n.metadata.uid)
                 }
                 Err(e) => {
-                    tracing::warn!(name = %name, id = srv.id, error = %e, "failed to pre-create k8s node")
+                    tracing::warn!(name = %name, id = srv.id, error = %e, "failed to pre-create k8s node");
+                    None
                 }
-            }
+            };
 
+            // Use core v1 Event (not events.k8s.io/v1) with source/involvedObject
+            // fields — this is what kubelet and node-controller use, and what k9s
+            // filters on when showing events for a Node.
+            let now = Time(k8s_openapi::chrono::Utc::now());
             let event = K8sEvent {
                 metadata: K8sObjectMeta {
                     generate_name: Some("binarylane-controller-".to_string()),
-                    namespace: Some(self.pod_namespace.clone()),
+                    namespace: Some("default".to_string()),
                     ..Default::default()
                 },
-                regarding: Some(ObjectReference {
+                involved_object: ObjectReference {
                     api_version: Some("v1".to_string()),
                     kind: Some("Node".to_string()),
                     name: Some(name.clone()),
-                    namespace: Some(self.pod_namespace.clone()),
+                    uid: node_uid,
                     ..Default::default()
-                }),
+                },
                 reason: Some("ServerCreated".to_string()),
-                note: Some(format!(
+                message: Some(format!(
                     "Created BinaryLane server {} ({}, {})",
                     srv.id, ng.size, ng.region
                 )),
                 type_: Some("Normal".to_string()),
-                reporting_controller: Some("binarylane-controller".to_string()),
-                reporting_instance: Some(self.pod_name.clone()),
+                source: Some(EventSource {
+                    component: Some("binarylane-controller".to_string()),
+                    ..Default::default()
+                }),
+                first_timestamp: Some(now.clone()),
+                last_timestamp: Some(now),
+                count: Some(1),
                 action: Some("ScaleUp".to_string()),
-                event_time: Some(MicroTime(k8s_openapi::chrono::Utc::now())),
                 ..Default::default()
             };
             if let Err(e) = events_api.create(&Default::default(), &event).await {
