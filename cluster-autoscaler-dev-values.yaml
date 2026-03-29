@@ -11,6 +11,7 @@ autoscalingGroups:
 
 extraArgs:
   cloud-config: /config/cloud-config
+  leader-elect: "false"
   scan-interval: "10s"
   scale-down-delay-after-add: "2m"
   scale-down-unneeded-time: "2m"

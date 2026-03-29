@@ -8,6 +8,7 @@ use tracing::{error, info};
 use crate::binarylane::{self, Client as BlClient};
 
 const UNINITIALIZED_TAINT: &str = "node.cloudprovider.kubernetes.io/uninitialized";
+pub const FINALIZER: &str = "blc.samcday.com/server-cleanup";
 
 pub async fn reconcile(bl: &BlClient, k8s: &KubeClient) {
     let nodes_api: Api<Node> = Api::all(k8s.clone());
@@ -42,6 +43,40 @@ async fn reconcile_node(
     name: &str,
     server_id: i64,
 ) -> Result<()> {
+    let has_finalizer = node
+        .metadata
+        .finalizers
+        .as_ref()
+        .is_some_and(|f| f.iter().any(|f| f == FINALIZER));
+
+    // Node is being deleted and has our finalizer: delete the BL server, then
+    // remove the finalizer so the node can be garbage-collected.
+    if node.metadata.deletion_timestamp.is_some() && has_finalizer {
+        info!(
+            node = name,
+            server_id, "node deleted, deleting BinaryLane server"
+        );
+        bl.delete_server(server_id)
+            .await
+            .context("deleting server")?;
+        let patch = serde_json::json!({
+            "metadata": {
+                "finalizers": node.metadata.finalizers.as_ref()
+                    .map(|f| f.iter().filter(|f| f.as_str() != FINALIZER).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            }
+        });
+        nodes_api
+            .patch(
+                name,
+                &PatchParams::apply("binarylane-controller"),
+                &kube::api::Patch::Merge(&patch),
+            )
+            .await
+            .context("removing finalizer")?;
+        return Ok(());
+    }
+
     let server = bl.get_server(server_id).await.context("getting server")?;
 
     let Some(server) = server else {
@@ -56,12 +91,14 @@ async fn reconcile_node(
     let mut needs_update = false;
     let mut needs_status_update = false;
 
-    // Build desired addresses
+    // Build desired addresses.
+    // BL reports phantom private IPs even without a VPC — skip them.
     let mut desired_addresses = Vec::new();
     for net in &server.networks.v4 {
         let addr_type = match net.net_type.as_str() {
             "public" => "ExternalIP",
-            "private" => "InternalIP",
+            "private" if server.vpc_id.is_some() => "InternalIP",
+            "private" => continue,
             _ => continue,
         };
         desired_addresses.push(serde_json::json!({
@@ -129,12 +166,12 @@ async fn reconcile_node(
         needs_status_update = true;
     }
 
-    if !needs_update && !needs_status_update && !has_uninit_taint {
+    if !needs_update && !needs_status_update {
         return Ok(());
     }
 
     // Patch spec/metadata if labels or taints changed
-    if needs_update || has_uninit_taint {
+    if needs_update {
         let new_taints: Vec<_> = taints
             .into_iter()
             .filter(|t| t.key != UNINITIALIZED_TAINT)

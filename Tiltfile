@@ -31,8 +31,11 @@ docker_build(
     only=["Cargo.toml", "Cargo.lock", "build.rs", "src/", "proto/", "xtask/Cargo.toml"],
 )
 
-# Deploy via Helm chart
-k8s_yaml(helm(
+# Deploy via Helm chart.
+# Cloud-init is read from a file so edits take effect immediately via Tilt
+# file-watching, without needing to re-run `cargo xtask dev-up`.
+_cloud_init = str(read_file("dev-cloud-init.sh")).strip()
+controller_manifests = helm(
     "chart",
     name="binarylane-controller",
     namespace="binarylane-system",
@@ -42,9 +45,19 @@ k8s_yaml(helm(
         "image.tag=latest",
         "image.pullPolicy=Always",
         "imagePullSecrets[0].name=" + registry_pull_secret,
+        "autoscaler.cloudInit=" + _cloud_init,
     ],
     values=["tilt-values.yaml", generated_values],
-))
+)
+k8s_yaml(controller_manifests)
+
+# Extract a change-detection hash from the mTLS client secret so we can
+# roll the cluster-autoscaler pod whenever certs are regenerated.
+_mtls_hash = ""
+for _obj in decode_yaml_stream(controller_manifests):
+    if _obj.get("kind") == "Secret" and _obj.get("metadata", {}).get("name") == "binarylane-controller-mtls-client":
+        _mtls_hash = str(hash(str(_obj.get("data", {}))))
+        break
 
 k8s_resource(
     "binarylane-controller",
@@ -69,11 +82,27 @@ data:
     cacert: "/etc/ssl/client-cert/ca.crt"
 """))
 
+_ca_flags = ["--values=cluster-autoscaler-dev-values.yaml"]
+if _mtls_hash:
+    _ca_flags.append("--set-string=podAnnotations.checksum/mtls-client=" + _mtls_hash)
+
 helm_resource(
     "cluster-autoscaler",
     "autoscaler-charts/cluster-autoscaler",
     namespace="binarylane-system",
-    flags=["--values=cluster-autoscaler-dev-values.yaml"],
+    flags=_ca_flags,
     resource_deps=["binarylane-controller"],
     labels=["autoscaler"],
+)
+
+# Scale-test deployment for exercising the autoscaler. Created with replicas=0
+# so it doesn't trigger scale-up by default. Use kubectl to scale:
+#   kubectl scale deploy/scale-test --replicas=3   # force node scale-up
+#   kubectl scale deploy/scale-test --replicas=0   # allow scale-down
+# Note: Tiltfile re-eval will reset replicas to 0. Just re-scale after.
+k8s_yaml("scale-test.yaml")
+k8s_resource(
+    "scale-test",
+    resource_deps=["cluster-autoscaler"],
+    labels=["test"],
 )

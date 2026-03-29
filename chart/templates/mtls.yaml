@@ -26,8 +26,6 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "binarylane-controller.labels" . | nindent 4 }}
-  annotations:
-    helm.sh/resource-policy: keep
 type: Opaque
 data:
   ca.crt: {{ $ca.Cert | b64enc }}

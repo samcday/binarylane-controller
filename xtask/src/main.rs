@@ -47,6 +47,8 @@ enum Commands {
     DevUp(Box<DevUpArgs>),
     /// Tear down the remote BinaryLane dev control plane from local state
     DevDown(DevDownArgs),
+    /// Launch Tilt with project-appropriate defaults (--port 0 to avoid collisions)
+    Tilt(TiltArgs),
 }
 
 #[derive(Debug, Args)]
@@ -122,6 +124,13 @@ struct DevUpArgs {
     /// Timeout used for server/SSH/k3s readiness
     #[arg(long, env = "BL_DEV_WAIT_TIMEOUT_SECS", default_value_t = 900)]
     wait_timeout_secs: u64,
+}
+
+#[derive(Debug, Args)]
+struct TiltArgs {
+    /// Extra arguments passed through to `tilt`
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -236,6 +245,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::DevUp(args) => cmd_dev_up(*args),
         Commands::DevDown(args) => cmd_dev_down(args),
+        Commands::Tilt(args) => cmd_tilt(args),
     }
 }
 
@@ -552,6 +562,26 @@ fn cmd_dev_down(args: DevDownArgs) -> Result<()> {
 
     eprintln!("Local dev state cleaned up");
     Ok(())
+}
+
+fn cmd_tilt(args: TiltArgs) -> Result<()> {
+    ensure_tool("tilt", "install Tilt: https://docs.tilt.dev/install.html")?;
+
+    let mut cmd = Command::new("tilt");
+
+    // Default to `up` if no subcommand given (or first arg is a flag).
+    let has_subcommand = args.args.first().is_some_and(|a| !a.starts_with('-'));
+    if !has_subcommand {
+        cmd.arg("up");
+    }
+
+    // --port 0 lets the OS pick a free port, avoiding collisions when
+    // multiple Tilt instances run across different projects.
+    cmd.arg("--port").arg("0");
+    cmd.args(&args.args);
+
+    let status = cmd.status().context("running tilt")?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn create_dev_server(
@@ -1358,9 +1388,6 @@ fn write_dev_tilt_values(
 ) -> Result<()> {
     ensure_parent_dir(tilt_values_path)?;
 
-    let cloud_init = dev_worker_cloud_init_template();
-    let cloud_init_indented = indent_block(&cloud_init, 4);
-
     let contents = format!(
         r#"autoscaler:
   enabled: true
@@ -1381,8 +1408,6 @@ fn write_dev_tilt_values(
         diskGb: 25
         labels:
           autoscale-group: "{group_id}"
-  cloudInit: |
-{cloud_init}
 mtls:
   enabled: true
 templateVars:
@@ -1394,7 +1419,6 @@ templateVars:
         size = yaml_escape(&args.size),
         region = yaml_escape(&args.region),
         image = yaml_escape(&args.image),
-        cloud_init = cloud_init_indented,
         k3s_url = yaml_escape(k3s_url),
         k3s_token = yaml_escape(k3s_token),
     );
@@ -1405,44 +1429,6 @@ templateVars:
             tilt_values_path.display()
         )
     })
-}
-
-fn dev_worker_cloud_init_template() -> String {
-    "#!/bin/sh
-set -eu
-if command -v cloud-init >/dev/null 2>&1; then
-  cloud-init status --wait || true
-fi
-if [ \"$(id -u)\" -eq 0 ]; then
-  SUDO=\"\"
-else
-  SUDO=\"sudo\"
-fi
-if ! command -v curl >/dev/null 2>&1; then
-  if command -v apt-get >/dev/null 2>&1; then
-    ${SUDO} apt-get update -y
-    ${SUDO} apt-get install -y curl
-  elif command -v dnf >/dev/null 2>&1; then
-    ${SUDO} dnf install -y curl
-  elif command -v apk >/dev/null 2>&1; then
-    ${SUDO} apk add --no-cache curl
-  fi
-fi
-if ! command -v k3s >/dev/null 2>&1; then
-  curl -sfL https://get.k3s.io | ${SUDO} env K3S_URL=\"{{.K3S_URL}}\" K3S_TOKEN=\"{{.K3S_TOKEN}}\" INSTALL_K3S_EXEC=\"agent --node-name {{.NodeName}} --node-label autoscale-group={{.NodeGroup}} --node-taint node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule\" sh -s -
-fi
-${SUDO} systemctl enable --now k3s-agent >/dev/null 2>&1 || true
-"
-    .to_string()
-}
-
-fn indent_block(block: &str, spaces: usize) -> String {
-    let indent = " ".repeat(spaces);
-    block
-        .lines()
-        .map(|line| format!("{indent}{line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn yaml_escape(value: &str) -> String {

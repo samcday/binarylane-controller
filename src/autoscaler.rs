@@ -1,9 +1,15 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use k8s_openapi::api::core::v1::{
+    Event as K8sEvent, EventSource, Node as K8sNode, NodeSpec as K8sNodeSpec, ObjectReference,
+    Taint as K8sTaint,
+};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta as K8sObjectMeta, Time};
 use k8s_pb::api::core::v1::{Node, NodeCondition, NodeSpec, NodeStatus, Taint};
 use k8s_pb::apimachinery::pkg::api::resource::Quantity;
 use k8s_pb::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::Api;
 use prost_014::Message;
 use serde::Deserialize;
 use tokio::sync::RwLock;
@@ -45,14 +51,16 @@ pub struct Config {
 
 pub struct Provider {
     bl: BlClient,
+    k8s: kube::Client,
     cfg: Config,
     servers: Arc<RwLock<HashMap<i64, binarylane::Server>>>,
 }
 
 impl Provider {
-    pub fn new(bl: BlClient, cfg: Config) -> Self {
+    pub fn new(bl: BlClient, k8s: kube::Client, cfg: Config) -> Self {
         Self {
             bl,
+            k8s,
             cfg,
             servers: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -78,6 +86,27 @@ impl Provider {
             result = result.replace(&format!("{{{{.{k}}}}}"), v);
         }
         result
+    }
+
+    fn node_labels(&self, ng: &NodeGroupConfig) -> BTreeMap<String, String> {
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            "node.kubernetes.io/instance-type".to_string(),
+            ng.size.clone(),
+        );
+        labels.insert(
+            "topology.kubernetes.io/region".to_string(),
+            ng.region.clone(),
+        );
+        // TODO: derive from size/config if BinaryLane adds ARM instances
+        labels.insert("kubernetes.io/arch".to_string(), "amd64".to_string());
+        labels.insert("kubernetes.io/os".to_string(), "linux".to_string());
+        labels.insert(
+            "node.kubernetes.io/cloud-provider".to_string(),
+            binarylane::PROVIDER_NAME.to_string(),
+        );
+        labels.extend(ng.labels.clone());
+        labels
     }
 }
 
@@ -247,10 +276,27 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
             )));
         }
 
+        let images = self
+            .bl
+            .list_images()
+            .await
+            .map_err(|e| Status::internal(format!("listing images: {e}")))?;
+        if !images
+            .iter()
+            .any(|image| image.slug.as_deref() == Some(ng.image.as_str()))
+        {
+            return Err(Status::invalid_argument(format!(
+                "image slug '{}' not found in BinaryLane image list",
+                ng.image
+            )));
+        }
+
         // NOTE: if a creation fails mid-loop, already-created servers remain.
         // The autoscaler's next refresh() will pick them up, but a retry before
         // refresh could overshoot max_size. Acceptable for now since the BL API
         // will reject servers beyond account quota anyway.
+        let node_api: Api<K8sNode> = Api::all(self.k8s.clone());
+        let events_api: Api<K8sEvent> = Api::namespaced(self.k8s.clone(), "default");
         for i in 0..req.delta {
             let ts = chrono_like_timestamp();
             let name = format!("{}{}-{ts}-{i}", self.cfg.name_prefix, ng.id);
@@ -281,6 +327,85 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
                 .map_err(|e| Status::internal(format!("creating server: {e}")))?;
 
             self.servers.write().await.insert(srv.id, srv.clone());
+
+            let mut labels = self.node_labels(&ng);
+            labels.insert("kubernetes.io/hostname".to_string(), name.clone());
+            let node = K8sNode {
+                metadata: K8sObjectMeta {
+                    name: Some(name.clone()),
+                    labels: Some(labels),
+                    finalizers: Some(vec![crate::node_controller::FINALIZER.to_string()]),
+                    ..Default::default()
+                },
+                spec: Some(K8sNodeSpec {
+                    provider_id: Some(binarylane::server_provider_id(srv.id)),
+                    taints: Some(vec![K8sTaint {
+                        key: "node.cloudprovider.kubernetes.io/uninitialized".to_string(),
+                        value: Some("true".to_string()),
+                        effect: "NoSchedule".to_string(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                status: None,
+            };
+            let node_uid = match node_api.create(&Default::default(), &node).await {
+                Ok(created) => {
+                    info!(name = %name, id = srv.id, "pre-created k8s node");
+                    created.metadata.uid
+                }
+                Err(kube::Error::Api(err)) if err.code == 409 => {
+                    info!(name = %name, id = srv.id, "k8s node already exists");
+                    node_api.get(&name).await.ok().and_then(|n| n.metadata.uid)
+                }
+                Err(e) => {
+                    tracing::warn!(name = %name, id = srv.id, error = %e, "failed to pre-create k8s node");
+                    None
+                }
+            };
+
+            // Use core v1 Event (not events.k8s.io/v1) with source/involvedObject
+            // fields — this is what kubelet and node-controller use, and what k9s
+            // filters on when showing events for a Node.
+            let now = Time(k8s_openapi::chrono::Utc::now());
+            let event = K8sEvent {
+                metadata: K8sObjectMeta {
+                    generate_name: Some("binarylane-controller-".to_string()),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                },
+                involved_object: ObjectReference {
+                    api_version: Some("v1".to_string()),
+                    kind: Some("Node".to_string()),
+                    name: Some(name.clone()),
+                    uid: node_uid,
+                    ..Default::default()
+                },
+                reason: Some("ServerCreated".to_string()),
+                message: Some(format!(
+                    "Created BinaryLane server {} ({}, {})",
+                    srv.id, ng.size, ng.region
+                )),
+                type_: Some("Normal".to_string()),
+                source: Some(EventSource {
+                    component: Some("binarylane-controller".to_string()),
+                    ..Default::default()
+                }),
+                first_timestamp: Some(now.clone()),
+                last_timestamp: Some(now),
+                count: Some(1),
+                action: Some("ScaleUp".to_string()),
+                ..Default::default()
+            };
+            if let Err(e) = events_api.create(&Default::default(), &event).await {
+                tracing::warn!(
+                    name = %name,
+                    id = srv.id,
+                    error = %e,
+                    "failed to emit server created event"
+                );
+            }
+
             info!(name = %name, id = srv.id, "created server");
         }
 
@@ -364,23 +489,11 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
             .find_group(id)
             .ok_or_else(|| Status::not_found(format!("node group {id} not found")))?;
 
-        let mut labels = BTreeMap::new();
+        let mut labels = self.node_labels(ng);
         labels.insert(
-            "node.kubernetes.io/instance-type".to_string(),
-            ng.size.clone(),
+            "kubernetes.io/hostname".to_string(),
+            format!("template-{}", ng.id),
         );
-        labels.insert(
-            "topology.kubernetes.io/region".to_string(),
-            ng.region.clone(),
-        );
-        // TODO: derive from size/config if BinaryLane adds ARM instances
-        labels.insert("kubernetes.io/arch".to_string(), "amd64".to_string());
-        labels.insert("kubernetes.io/os".to_string(), "linux".to_string());
-        labels.insert(
-            "node.kubernetes.io/cloud-provider".to_string(),
-            binarylane::PROVIDER_NAME.to_string(),
-        );
-        labels.extend(ng.labels.clone());
 
         let mut capacity = BTreeMap::new();
         capacity.insert(
