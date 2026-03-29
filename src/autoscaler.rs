@@ -57,12 +57,7 @@ pub struct Provider {
 }
 
 impl Provider {
-    pub fn new(
-        bl: BlClient,
-        k8s: kube::Client,
-        cfg: Config,
-        pod_name: String,
-    ) -> Self {
+    pub fn new(bl: BlClient, k8s: kube::Client, cfg: Config, pod_name: String) -> Self {
         Self {
             bl,
             k8s,
@@ -323,9 +318,7 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
                 metadata: K8sObjectMeta {
                     name: Some(name.clone()),
                     labels: Some(self.node_labels(&ng)),
-                    finalizers: Some(vec![
-                        crate::node_controller::FINALIZER.to_string(),
-                    ]),
+                    finalizers: Some(vec![crate::node_controller::FINALIZER.to_string()]),
                     ..Default::default()
                 },
                 spec: Some(K8sNodeSpec {

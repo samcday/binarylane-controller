@@ -52,7 +52,10 @@ async fn reconcile_node(
     // Node is being deleted and has our finalizer: delete the BL server, then
     // remove the finalizer so the node can be garbage-collected.
     if node.metadata.deletion_timestamp.is_some() && has_finalizer {
-        info!(node = name, server_id, "node deleted, deleting BinaryLane server");
+        info!(
+            node = name,
+            server_id, "node deleted, deleting BinaryLane server"
+        );
         bl.delete_server(server_id)
             .await
             .context("deleting server")?;
@@ -64,7 +67,11 @@ async fn reconcile_node(
             }
         });
         nodes_api
-            .patch(name, &PatchParams::apply("binarylane-controller"), &kube::api::Patch::Merge(&patch))
+            .patch(
+                name,
+                &PatchParams::apply("binarylane-controller"),
+                &kube::api::Patch::Merge(&patch),
+            )
             .await
             .context("removing finalizer")?;
         return Ok(());
