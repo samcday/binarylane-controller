@@ -1426,7 +1426,7 @@ if ! command -v curl >/dev/null 2>&1; then
   fi
 fi
 if ! command -v k3s >/dev/null 2>&1; then
-  curl -sfL https://get.k3s.io | ${SUDO} env K3S_URL=\"{{.K3S_URL}}\" K3S_TOKEN=\"{{.K3S_TOKEN}}\" INSTALL_K3S_EXEC=\"agent --node-name {{.NodeName}}\" sh -s -
+  curl -sfL https://get.k3s.io | ${SUDO} env K3S_URL=\"{{.K3S_URL}}\" K3S_TOKEN=\"{{.K3S_TOKEN}}\" INSTALL_K3S_EXEC=\"agent --node-name {{.NodeName}} --node-label autoscale-group={{.NodeGroup}} --node-taint node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule\" sh -s -
 fi
 ${SUDO} systemctl enable --now k3s-agent >/dev/null 2>&1 || true
 "

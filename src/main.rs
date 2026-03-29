@@ -137,7 +137,8 @@ async fn main() -> Result<()> {
 
     let pod_name =
         std::env::var("POD_NAME").unwrap_or_else(|_| "binarylane-controller".to_string());
-    let provider = autoscaler::Provider::new(bl, k8s.clone(), cfg.clone(), pod_name);
+    let pod_namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| "default".to_string());
+    let provider = autoscaler::Provider::new(bl, k8s.clone(), cfg.clone(), pod_name, pod_namespace);
     let svc = proto::cloud_provider_server::CloudProviderServer::new(provider);
 
     info!(

@@ -53,16 +53,24 @@ pub struct Provider {
     k8s: kube::Client,
     cfg: Config,
     pod_name: String,
+    pod_namespace: String,
     servers: Arc<RwLock<HashMap<i64, binarylane::Server>>>,
 }
 
 impl Provider {
-    pub fn new(bl: BlClient, k8s: kube::Client, cfg: Config, pod_name: String) -> Self {
+    pub fn new(
+        bl: BlClient,
+        k8s: kube::Client,
+        cfg: Config,
+        pod_name: String,
+        pod_namespace: String,
+    ) -> Self {
         Self {
             bl,
             k8s,
             cfg,
             pod_name,
+            pod_namespace,
             servers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -282,7 +290,7 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
         // refresh could overshoot max_size. Acceptable for now since the BL API
         // will reject servers beyond account quota anyway.
         let node_api: Api<K8sNode> = Api::all(self.k8s.clone());
-        let events_api: Api<K8sEvent> = Api::namespaced(self.k8s.clone(), "default");
+        let events_api: Api<K8sEvent> = Api::namespaced(self.k8s.clone(), &self.pod_namespace);
         for i in 0..req.delta {
             let ts = chrono_like_timestamp();
             let name = format!("{}{}-{ts}-{i}", self.cfg.name_prefix, ng.id);
@@ -346,7 +354,7 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
             let event = K8sEvent {
                 metadata: K8sObjectMeta {
                     generate_name: Some("binarylane-controller-".to_string()),
-                    namespace: Some("default".to_string()),
+                    namespace: Some(self.pod_namespace.clone()),
                     ..Default::default()
                 },
                 regarding: Some(ObjectReference {

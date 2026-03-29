@@ -166,12 +166,12 @@ async fn reconcile_node(
         needs_status_update = true;
     }
 
-    if !needs_update && !needs_status_update && !has_uninit_taint {
+    if !needs_update && !needs_status_update {
         return Ok(());
     }
 
     // Patch spec/metadata if labels or taints changed
-    if needs_update || has_uninit_taint {
+    if needs_update {
         let new_taints: Vec<_> = taints
             .into_iter()
             .filter(|t| t.key != UNINITIALIZED_TAINT)
