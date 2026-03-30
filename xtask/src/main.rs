@@ -53,6 +53,12 @@ enum Commands {
 
 #[derive(Debug, Args)]
 struct DevUpArgs {
+    /// Instance name for parallel dev environments (e.g. CI matrix jobs).
+    /// When set, all default paths move under `.dev/{instance}/` and resource
+    /// names are derived from the instance name instead of the local username.
+    #[arg(long, env = "BL_DEV_INSTANCE")]
+    instance: Option<String>,
+
     /// BinaryLane API token
     #[arg(long, env = "BL_API_TOKEN")]
     bl_api_token: String,
@@ -135,6 +141,12 @@ struct TiltArgs {
 
 #[derive(Debug, Args)]
 struct DevDownArgs {
+    /// Instance name for parallel dev environments (e.g. CI matrix jobs).
+    /// When set, all default paths move under `.dev/{instance}/` and resource
+    /// names are derived from the instance name instead of the local username.
+    #[arg(long, env = "BL_DEV_INSTANCE")]
+    instance: Option<String>,
+
     /// BinaryLane API token (required only if a tracked server must be deleted)
     #[arg(long, env = "BL_API_TOKEN")]
     bl_api_token: Option<String>,
@@ -249,7 +261,101 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
+/// Replace a path field with an instance-scoped value when it still holds its
+/// compile-time default (i.e. the user did not explicitly override it).
+fn override_path_default(field: &mut PathBuf, default: &str, instance_path: &str) {
+    if *field == Path::new(default) {
+        *field = PathBuf::from(instance_path);
+    }
+}
+
+/// Apply instance-specific default overrides to the path fields shared by both
+/// `DevUpArgs` and `DevDownArgs`.
+fn apply_common_instance_paths(
+    inst: &str,
+    state_file: &mut PathBuf,
+    kubeconfig_out: &mut PathBuf,
+    known_hosts: &mut PathBuf,
+    docker_config_dir: &mut PathBuf,
+    tilt_values_out: &mut PathBuf,
+) {
+    override_path_default(
+        state_file,
+        DEFAULT_STATE_FILE,
+        &format!(".dev/{inst}/state.json"),
+    );
+    override_path_default(
+        kubeconfig_out,
+        DEFAULT_KUBECONFIG_OUT,
+        &format!(".dev/{inst}/kubeconfig"),
+    );
+    override_path_default(
+        known_hosts,
+        DEFAULT_KNOWN_HOSTS,
+        &format!(".dev/{inst}/known_hosts"),
+    );
+    override_path_default(
+        docker_config_dir,
+        DEFAULT_DOCKER_CONFIG_DIR,
+        &format!(".dev/{inst}/docker"),
+    );
+    override_path_default(
+        tilt_values_out,
+        DEFAULT_TILT_VALUES_OUT,
+        &format!(".dev/{inst}/tilt-values.yaml"),
+    );
+}
+
+/// Apply instance-specific default overrides to `DevUpArgs`.
+///
+/// For each field, we only overwrite it if the user did not explicitly pass a
+/// value (detected by comparing against the compile-time / computed default).
+fn apply_instance_overrides_up(args: &mut DevUpArgs) {
+    let inst = match &args.instance {
+        Some(i) => i.as_str(),
+        None => return,
+    };
+
+    apply_common_instance_paths(
+        inst,
+        &mut args.state_file,
+        &mut args.kubeconfig_out,
+        &mut args.known_hosts,
+        &mut args.docker_config_dir,
+        &mut args.tilt_values_out,
+    );
+    override_path_default(
+        &mut args.ssh_key_path,
+        DEFAULT_MANAGED_SSH_KEY_PATH,
+        &format!(".dev/{inst}/ssh-key"),
+    );
+    if args.server_name == default_server_name() {
+        args.server_name = format!("blc-{inst}");
+    }
+    if args.ssh_key_name == default_ssh_key_name() {
+        args.ssh_key_name = format!("blc-{inst}");
+    }
+}
+
+/// Apply instance-specific default overrides to `DevDownArgs`.
+fn apply_instance_overrides_down(args: &mut DevDownArgs) {
+    let inst = match &args.instance {
+        Some(i) => i.as_str(),
+        None => return,
+    };
+
+    apply_common_instance_paths(
+        inst,
+        &mut args.state_file,
+        &mut args.kubeconfig_out,
+        &mut args.known_hosts,
+        &mut args.docker_config_dir,
+        &mut args.tilt_values_out,
+    );
+}
+
+fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
+    apply_instance_overrides_up(&mut args);
     ensure_tool("ssh", "install OpenSSH client")?;
     ensure_tool("ssh-keygen", "install OpenSSH tools")?;
 
@@ -497,7 +603,8 @@ fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_dev_down(args: DevDownArgs) -> Result<()> {
+fn cmd_dev_down(mut args: DevDownArgs) -> Result<()> {
+    apply_instance_overrides_down(&mut args);
     let state = load_state(&args.state_file)?;
 
     let needs_api = state.server_id.is_some() || state.ssh_key_id.is_some();
