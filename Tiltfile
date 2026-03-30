@@ -28,7 +28,7 @@ docker_build(
     registry_image,
     ".",
     dockerfile="Dockerfile",
-    only=["Cargo.toml", "Cargo.lock", "build.rs", "src/", "proto/", "binarylane-client/", "xtask/Cargo.toml"],
+    only=["Cargo.toml", "Cargo.lock", "build.rs", "src/", "proto/", "binarylane-client/"],
 )
 
 # Generate stable mTLS certs for dev. These persist in .dev/ and are only
