@@ -1,5 +1,6 @@
 apiVersion: apps/v1
 kind: Deployment
+{{- $tlsEnabled := or (and .Values.autoscaler.enabled .Values.mtls.enabled) (and .Values.externalDns.enabled .Values.externalDns.mtls.enabled) }}
 metadata:
   name: {{ include "binarylane-controller.fullname" . }}
   namespace: {{ .Release.Namespace }}
@@ -14,7 +15,7 @@ spec:
     metadata:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        {{- if and .Values.autoscaler.enabled .Values.mtls.enabled }}
+        {{- if $tlsEnabled }}
         checksum/mtls: {{ include (print $.Template.BasePath "/mtls.yaml") . | sha256sum }}
         {{- end }}
         {{- with .Values.podAnnotations }}
@@ -49,7 +50,11 @@ spec:
             - name: GRPC_LISTEN_ADDR
               value: {{ .Values.autoscaler.listenAddr | quote }}
             {{- end }}
-            {{- if and .Values.autoscaler.enabled .Values.mtls.enabled }}
+            {{- if .Values.externalDns.enabled }}
+            - name: EXTERNAL_DNS_LISTEN_ADDR
+              value: {{ .Values.externalDns.listenAddr | quote }}
+            {{- end }}
+            {{- if $tlsEnabled }}
             - name: TLS_CERT_PATH
               value: /etc/binarylane-controller/tls/tls.crt
             - name: TLS_KEY_PATH
@@ -61,18 +66,27 @@ spec:
             - name: TMPL_{{ $key }}
               value: {{ $value | quote }}
             {{- end }}
-          {{- if .Values.autoscaler.enabled }}
+          {{- if or .Values.autoscaler.enabled .Values.externalDns.enabled }}
           ports:
+            {{- if .Values.autoscaler.enabled }}
             - name: grpc
               containerPort: 8086
               protocol: TCP
+            {{- end }}
+            {{- if .Values.externalDns.enabled }}
+            - name: webhook
+              containerPort: 8888
+              protocol: TCP
+            {{- end }}
           {{- end }}
-          {{- if .Values.autoscaler.enabled }}
+          {{- if or .Values.autoscaler.enabled $tlsEnabled }}
           volumeMounts:
+            {{- if .Values.autoscaler.enabled }}
             - name: config
               mountPath: /etc/binarylane-controller
               readOnly: true
-            {{- if .Values.mtls.enabled }}
+            {{- end }}
+            {{- if $tlsEnabled }}
             - name: tls
               mountPath: /etc/binarylane-controller/tls
               readOnly: true
@@ -82,12 +96,14 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-      {{- if .Values.autoscaler.enabled }}
+      {{- if or .Values.autoscaler.enabled $tlsEnabled }}
       volumes:
+        {{- if .Values.autoscaler.enabled }}
         - name: config
           configMap:
             name: {{ include "binarylane-controller.fullname" . }}
-        {{- if .Values.mtls.enabled }}
+        {{- end }}
+        {{- if $tlsEnabled }}
         - name: tls
           secret:
             secretName: {{ include "binarylane-controller.fullname" . }}-mtls-server

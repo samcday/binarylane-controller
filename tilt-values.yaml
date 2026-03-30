@@ -5,6 +5,9 @@ apiToken: "dev-token-replace-me"
 autoscaler:
   enabled: false
 
+externalDns:
+  enabled: true
+
 mtls:
   enabled: false
 

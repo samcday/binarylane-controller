@@ -36,6 +36,17 @@ mtls:
   # Name of the Secret created with client credentials for cluster-autoscaler
   clientSecretName: binarylane-controller-mtls-client
 
+# External-DNS webhook provider configuration
+externalDns:
+  enabled: true
+  listenAddr: "0.0.0.0:8888"
+  mtls:
+    enabled: true
+    clientSecretName: binarylane-controller-external-dns-mtls-client
+  service:
+    type: ClusterIP
+    port: 8888
+
 grpcService:
   type: ClusterIP
   port: 8086

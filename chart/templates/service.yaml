@@ -1,4 +1,4 @@
-{{- if .Values.autoscaler.enabled }}
+{{- if or .Values.autoscaler.enabled .Values.externalDns.enabled }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -7,12 +7,24 @@ metadata:
   labels:
     {{- include "binarylane-controller.labels" . | nindent 4 }}
 spec:
+  {{- if .Values.autoscaler.enabled }}
   type: {{ .Values.grpcService.type }}
+  {{- else }}
+  type: {{ .Values.externalDns.service.type }}
+  {{- end }}
   ports:
+    {{- if .Values.autoscaler.enabled }}
     - port: {{ .Values.grpcService.port }}
       targetPort: grpc
       protocol: TCP
       name: grpc
+    {{- end }}
+    {{- if .Values.externalDns.enabled }}
+    - port: {{ .Values.externalDns.service.port }}
+      targetPort: webhook
+      protocol: TCP
+      name: webhook
+    {{- end }}
   selector:
     {{- include "binarylane-controller.selectorLabels" . | nindent 4 }}
 {{- end }}

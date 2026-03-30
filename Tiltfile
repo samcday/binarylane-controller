@@ -95,6 +95,32 @@ helm_resource(
     labels=["autoscaler"],
 )
 
+# DNSEndpoint CRD for external-dns CRD source
+local("KUBECONFIG=$KUBECONFIG kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/external-dns/master/config/crd/standard/dnsendpoints.externaldns.k8s.io.yaml 2>&1 || true", quiet=True)
+
+# Official external-dns chart for dev DNS management testing
+helm_repo("external-dns-charts", "https://kubernetes-sigs.github.io/external-dns")
+
+# Extract mTLS hash from external-dns client secret for rollout detection
+_ed_mtls_hash = ""
+for _obj in decode_yaml_stream(controller_manifests):
+    if _obj.get("kind") == "Secret" and _obj.get("metadata", {}).get("name") == "binarylane-controller-external-dns-mtls-client":
+        _ed_mtls_hash = str(hash(str(_obj.get("data", {}))))
+        break
+
+_ed_flags = ["--values=external-dns-dev-values.yaml"]
+if _ed_mtls_hash:
+    _ed_flags.append("--set-string=podAnnotations.checksum/mtls-client=" + _ed_mtls_hash)
+
+helm_resource(
+    "external-dns",
+    "external-dns-charts/external-dns",
+    namespace="binarylane-system",
+    flags=_ed_flags,
+    resource_deps=["binarylane-controller"],
+    labels=["dns"],
+)
+
 # Scale-test deployment for exercising the autoscaler. Created with replicas=0
 # so it doesn't trigger scale-up by default. Use kubectl to scale:
 #   kubectl scale deploy/scale-test --replicas=3   # force node scale-up

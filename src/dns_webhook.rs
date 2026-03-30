@@ -50,12 +50,19 @@ struct DomainFilter {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Endpoint {
+    #[serde(default)]
     dns_name: String,
+    #[serde(default)]
     targets: Vec<String>,
+    #[serde(default)]
     record_type: String,
-    #[serde(rename = "recordTTL")]
+    #[serde(default, rename = "recordTTL")]
     record_ttl: i64,
+    #[serde(default)]
+    set_identifier: String,
+    #[serde(default)]
     labels: HashMap<String, String>,
+    #[serde(default)]
     provider_specific: Vec<ProviderSpecificProperty>,
 }
 
@@ -183,6 +190,7 @@ async fn get_records(
                 targets: Vec::new(),
                 record_type: record.record_type.clone(),
                 record_ttl: record.ttl,
+                set_identifier: String::new(),
                 labels: HashMap::new(),
                 provider_specific: Vec::new(),
             });
