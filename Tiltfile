@@ -28,7 +28,7 @@ docker_build(
     registry_image,
     ".",
     dockerfile="Dockerfile",
-    only=["Cargo.toml", "Cargo.lock", "build.rs", "src/", "proto/", "xtask/Cargo.toml"],
+    only=["Cargo.toml", "Cargo.lock", "build.rs", "src/", "proto/", "binarylane-client/", "xtask/Cargo.toml"],
 )
 
 # Deploy via Helm chart.

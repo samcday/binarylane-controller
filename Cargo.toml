@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "xtask"]
+members = [".", "binarylane-client", "integration-tests", "xtask"]
 
 [package]
 name = "binarylane-controller"
@@ -8,6 +8,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+binarylane-client = { path = "binarylane-client" }
 clap = { version = "4", features = ["derive", "env"] }
 k8s-openapi = { version = "0.25", features = ["v1_33"] }
 k8s-pb = "0.9"

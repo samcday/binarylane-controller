@@ -28,10 +28,8 @@ pub struct Server {
     pub status: String,
     pub size_slug: String,
     pub region: Region,
-    #[allow(dead_code)]
     pub image: Image,
     pub networks: Networks,
-    #[allow(dead_code)]
     pub vpc_id: Option<i64>,
 }
 
@@ -42,20 +40,15 @@ pub struct Region {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Image {
-    #[allow(dead_code)]
     pub slug: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListedImage {
-    #[allow(dead_code)]
     pub id: i64,
     pub slug: Option<String>,
-    #[allow(dead_code)]
     pub name: String,
-    #[allow(dead_code)]
     pub distribution: String,
-    #[allow(dead_code)]
     pub status: String,
 }
 
@@ -88,11 +81,9 @@ pub struct LoadBalancer {
     pub id: i64,
     pub name: String,
     pub ip: String,
-    #[allow(dead_code)]
     pub status: String,
     pub forwarding_rules: Vec<ForwardingRule>,
     pub server_ids: Vec<i64>,
-    #[allow(dead_code)]
     pub region: Region,
 }
 

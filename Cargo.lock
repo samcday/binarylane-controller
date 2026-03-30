@@ -217,10 +217,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "binarylane-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+]
+
+[[package]]
 name = "binarylane-controller"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "binarylane-client",
  "clap",
  "k8s-openapi",
  "k8s-pb",
@@ -1136,6 +1146,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "integration-tests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "binarylane-client",
+ "k8s-openapi",
+ "kube",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

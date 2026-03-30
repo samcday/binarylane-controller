@@ -1,5 +1,5 @@
 mod autoscaler;
-mod binarylane;
+use binarylane_client as binarylane;
 mod node_controller;
 mod service_controller;
 

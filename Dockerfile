@@ -6,9 +6,10 @@ WORKDIR /src
 # Copy manifests, build script, and proto definitions first for layer caching
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto/ proto/
+COPY binarylane-client/ binarylane-client/
 
-# Strip xtask from workspace — it's a dev tool, not shipped in the image
-RUN sed -i '/xtask/d' Cargo.toml
+# Strip xtask and integration-tests from workspace — dev-only, not shipped
+RUN sed -i '/"xtask"/d; /"integration-tests"/d' Cargo.toml
 
 # Create dummy source so cargo can fetch + compile all dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs && \
