@@ -1,5 +1,6 @@
 mod autoscaler;
 use binarylane_client as binarylane;
+mod dns_webhook;
 mod node_controller;
 mod service_controller;
 
@@ -41,6 +42,10 @@ struct Args {
     /// gRPC listen address
     #[arg(long, env = "GRPC_LISTEN_ADDR", default_value = "0.0.0.0:8086")]
     grpc_listen_addr: String,
+
+    /// external-dns webhook listen address
+    #[arg(long, env = "EXTERNAL_DNS_LISTEN_ADDR")]
+    external_dns_listen_addr: Option<String>,
 
     /// TLS certificate path (enables mTLS when all three TLS args are set)
     #[arg(long, env = "TLS_CERT_PATH")]
@@ -113,6 +118,49 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     });
 
+    let tls_vars = [&args.tls_cert_path, &args.tls_key_path, &args.tls_ca_path];
+    let tls_set = tls_vars.iter().filter(|v| v.is_some()).count();
+    if tls_set > 0 && tls_set < 3 {
+        warn!(
+            "partial TLS config: all three of TLS_CERT_PATH, TLS_KEY_PATH, TLS_CA_PATH must be set to enable mTLS, falling back to plaintext"
+        );
+    }
+
+    let shared_tls = if let (Some(cert_path), Some(key_path), Some(ca_path)) =
+        (&args.tls_cert_path, &args.tls_key_path, &args.tls_ca_path)
+    {
+        let cert_pem = tokio::fs::read(cert_path)
+            .await
+            .context("reading TLS cert")?;
+        let key_pem = tokio::fs::read(key_path).await.context("reading TLS key")?;
+        let ca_pem = tokio::fs::read(ca_path)
+            .await
+            .context("reading TLS CA cert")?;
+
+        Some(dns_webhook::TlsConfig {
+            cert_pem,
+            key_pem,
+            ca_pem,
+        })
+    } else {
+        None
+    };
+
+    if let Some(listen_addr) = args.external_dns_listen_addr.clone() {
+        let addr = listen_addr
+            .parse()
+            .context("parsing external-dns listen address")?;
+        let bl_dns = bl.clone();
+        let tls = shared_tls.clone();
+        tokio::spawn(async move {
+            info!(addr = %listen_addr, "external-dns webhook starting");
+            if let Err(e) = dns_webhook::run(bl_dns, addr, tls).await {
+                error!(error = %e, "external-dns webhook server error");
+                std::process::exit(1);
+            }
+        });
+    }
+
     // Load autoscaler config
     let cfg_data = match tokio::fs::read_to_string(&args.config_path).await {
         Ok(data) => data,
@@ -151,28 +199,10 @@ async fn main() -> Result<()> {
 
     let mut server = Server::builder();
 
-    let tls_vars = [&args.tls_cert_path, &args.tls_key_path, &args.tls_ca_path];
-    let tls_set = tls_vars.iter().filter(|v| v.is_some()).count();
-    if tls_set > 0 && tls_set < 3 {
-        warn!(
-            "partial TLS config: all three of TLS_CERT_PATH, TLS_KEY_PATH, TLS_CA_PATH must be set to enable mTLS, falling back to plaintext"
-        );
-    }
-
-    if let (Some(cert_path), Some(key_path), Some(ca_path)) =
-        (&args.tls_cert_path, &args.tls_key_path, &args.tls_ca_path)
-    {
-        let cert = tokio::fs::read(cert_path)
-            .await
-            .context("reading TLS cert")?;
-        let key = tokio::fs::read(key_path).await.context("reading TLS key")?;
-        let ca_cert = tokio::fs::read(ca_path)
-            .await
-            .context("reading TLS CA cert")?;
-
+    if let Some(tls) = &shared_tls {
         let tls_config = ServerTlsConfig::new()
-            .identity(Identity::from_pem(&cert, &key))
-            .client_ca_root(Certificate::from_pem(&ca_cert));
+            .identity(Identity::from_pem(&tls.cert_pem, &tls.key_pem))
+            .client_ca_root(Certificate::from_pem(&tls.ca_pem));
 
         server = server.tls_config(tls_config).context("configuring mTLS")?;
         info!("mTLS enabled for gRPC server");

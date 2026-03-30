@@ -1,0 +1,47 @@
+# Values for the official external-dns chart in dev.
+# Connects to our controller's webhook provider via mTLS.
+image:
+  repository: ghcr.io/samcday/external-dns
+  tag: latest
+
+provider:
+  name: webhook
+  webhook:
+    image:
+      repository: registry.k8s.io/pause
+      tag: "3.10"
+    env: []
+    livenessProbe: null
+    readinessProbe: null
+
+sources:
+  - service
+  - ingress
+  - crd
+
+logLevel: debug
+policy: sync
+txtOwnerId: bl-dev
+
+extraArgs:
+  webhook-provider-url: https://binarylane-controller.binarylane-system.svc:8888
+  tls-ca: /etc/ssl/client-cert/ca.crt
+  tls-client-cert: /etc/ssl/client-cert/tls.crt
+  tls-client-cert-key: /etc/ssl/client-cert/tls.key
+
+extraVolumes:
+  - name: webhook-client-cert
+    secret:
+      secretName: binarylane-controller-external-dns-mtls-client
+      defaultMode: 292
+
+extraVolumeMounts:
+  - name: webhook-client-cert
+    mountPath: /etc/ssl/client-cert
+    readOnly: true
+
+serviceAccount:
+  create: true
+
+rbac:
+  create: true

@@ -22,6 +22,13 @@ Create a default fully qualified app name.
 {{- end }}
 
 {{/*
+Extract port number from a listenAddr like "0.0.0.0:8086"
+*/}}
+{{- define "binarylane-controller.port" -}}
+{{- splitList ":" . | last | int -}}
+{{- end -}}
+
+{{/*
 Common labels
 */}}
 {{- define "binarylane-controller.labels" -}}
