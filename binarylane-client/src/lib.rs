@@ -126,6 +126,40 @@ pub struct UpdateLoadBalancerRequest {
     pub server_ids: Vec<i64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct Domain {
+    pub id: i64,
+    pub name: String,
+    pub ttl: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DomainRecord {
+    pub id: i64,
+    #[serde(rename = "type")]
+    pub record_type: String,
+    pub name: String,
+    pub data: String,
+    pub priority: Option<i64>,
+    pub port: Option<i64>,
+    pub weight: Option<i64>,
+    pub ttl: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateDomainRecordRequest {
+    #[serde(rename = "type")]
+    pub record_type: String,
+    pub name: String,
+    pub data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<i64>,
+}
+
 impl Client {
     pub fn new(token: String) -> Self {
         Self {
@@ -360,6 +394,146 @@ impl Client {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             bail!("deleting load balancer {lb_id}: {status}: {body}");
+        }
+        Ok(())
+    }
+
+    pub async fn list_domains(&self) -> Result<Vec<Domain>> {
+        let mut all = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let resp = self
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/domains?page={page}&per_page=100"),
+                )
+                .send()
+                .await
+                .context("listing domains")?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("listing domains: {status}: {body}");
+            }
+            #[derive(Deserialize)]
+            struct Pages {
+                next: Option<String>,
+            }
+            #[derive(Deserialize)]
+            struct Links {
+                pages: Pages,
+            }
+            #[derive(Deserialize)]
+            struct Resp {
+                domains: Vec<Domain>,
+                links: Option<Links>,
+            }
+            let r: Resp = resp.json().await.context("decoding domains")?;
+            all.extend(r.domains);
+            if r.links.and_then(|l| l.pages.next).is_none() {
+                break;
+            }
+            page += 1;
+        }
+        Ok(all)
+    }
+
+    pub async fn list_domain_records(&self, domain: &str) -> Result<Vec<DomainRecord>> {
+        let mut all = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let resp = self
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/domains/{domain}/records?page={page}&per_page=100"),
+                )
+                .send()
+                .await
+                .context("listing domain records")?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("listing domain records for {domain}: {status}: {body}");
+            }
+            #[derive(Deserialize)]
+            struct Pages {
+                next: Option<String>,
+            }
+            #[derive(Deserialize)]
+            struct Links {
+                pages: Pages,
+            }
+            #[derive(Deserialize)]
+            struct Resp {
+                domain_records: Vec<DomainRecord>,
+                links: Option<Links>,
+            }
+            let r: Resp = resp.json().await.context("decoding domain records")?;
+            all.extend(r.domain_records);
+            if r.links.and_then(|l| l.pages.next).is_none() {
+                break;
+            }
+            page += 1;
+        }
+        Ok(all)
+    }
+
+    pub async fn create_domain_record(
+        &self,
+        domain: &str,
+        req: CreateDomainRecordRequest,
+    ) -> Result<DomainRecord> {
+        let resp = self
+            .request(reqwest::Method::POST, &format!("/domains/{domain}/records"))
+            .json(&req)
+            .send()
+            .await
+            .context("creating domain record")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("creating domain record in {domain}: {status}: {body}");
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            domain_record: DomainRecord,
+        }
+        let r: Resp = resp.json().await.context("decoding domain record")?;
+        Ok(r.domain_record)
+    }
+
+    pub async fn delete_domain_record(&self, domain: &str, record_id: i64) -> Result<()> {
+        let resp = self
+            .request(
+                reqwest::Method::DELETE,
+                &format!("/domains/{domain}/records/{record_id}"),
+            )
+            .send()
+            .await
+            .context("deleting domain record")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("deleting domain record {record_id} in {domain}: {status}: {body}");
+        }
+        Ok(())
+    }
+
+    pub async fn refresh_nameserver_cache(&self, domain_names: &[&str]) -> Result<()> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            domain_names: &'a [&'a str],
+        }
+        let resp = self
+            .request(reqwest::Method::POST, "/domains/refresh_nameserver_cache")
+            .json(&Req { domain_names })
+            .send()
+            .await
+            .context("refreshing nameserver cache")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("refreshing nameserver cache: {status}: {body}");
         }
         Ok(())
     }
