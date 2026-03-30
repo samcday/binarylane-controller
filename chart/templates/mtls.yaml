@@ -7,6 +7,10 @@
 {{- $ca := dict -}}
 {{- $serverCert := dict -}}
 {{- if and $existingServer $existingServer.data }}
+{{- /* Reuse the existing CA cert. The CA private key is not stored, so buildCustomCert
+       receives ca.crt as both arguments. This works for reusing the CA identity but cannot
+       sign new client certs — if a client secret is manually deleted while the server secret
+       exists, delete the server secret too to force full cert regeneration. */ -}}
 {{- $ca = buildCustomCert (index $existingServer.data "ca.crt") (index $existingServer.data "ca.crt") -}}
 {{- $serverCert = dict "Cert" (index $existingServer.data "tls.crt" | b64dec) "Key" (index $existingServer.data "tls.key" | b64dec) -}}
 {{- else }}

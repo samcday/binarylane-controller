@@ -128,10 +128,8 @@ pub struct UpdateLoadBalancerRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Domain {
-    #[allow(dead_code)]
     pub id: i64,
     pub name: String,
-    #[allow(dead_code)]
     pub ttl: i64,
 }
 
@@ -142,16 +140,12 @@ pub struct DomainRecord {
     pub record_type: String,
     pub name: String,
     pub data: String,
-    #[allow(dead_code)]
     pub priority: Option<i64>,
-    #[allow(dead_code)]
     pub port: Option<i64>,
-    #[allow(dead_code)]
     pub weight: Option<i64>,
     pub ttl: i64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct CreateDomainRecordRequest {
     #[serde(rename = "type")]

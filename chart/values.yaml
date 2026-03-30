@@ -20,7 +20,7 @@ serviceAccount:
 
 # Autoscaler gRPC provider configuration
 autoscaler:
-  enabled: true
+  enabled: false
   # Node group configuration (JSON)
   config: {}
   # Cloud-init template
@@ -38,17 +38,17 @@ mtls:
 
 # External-DNS webhook provider configuration
 externalDns:
-  enabled: true
+  enabled: false
   listenAddr: "0.0.0.0:8888"
   mtls:
     enabled: true
     clientSecretName: binarylane-controller-external-dns-mtls-client
 
 service:
+  # Shared across all controller ports. Both autoscaler and external-dns
+  # endpoints are exposed on a single Service; split into separate Services
+  # if you need different types per port. Ports are derived from listenAddr values.
   type: ClusterIP
-  # Ports exposed by the controller service
-  autoscalerPort: 8086
-  externalDnsPort: 8888
 
 resources:
   requests:

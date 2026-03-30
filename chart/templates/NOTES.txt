@@ -5,12 +5,12 @@ Node controller is running and will reconcile K8s nodes with BinaryLane servers 
 {{- if .Values.autoscaler.enabled }}
 
 Autoscaler gRPC provider is enabled.
-Service: {{ include "binarylane-controller.fullname" . }}:{{ .Values.service.autoscalerPort }}
+Service: {{ include "binarylane-controller.fullname" . }}:{{ include "binarylane-controller.port" .Values.autoscaler.listenAddr }}
 
 Configure cluster-autoscaler to use this endpoint:
   --cloud-provider=externalgrpc
   --cloud-config=<path-to-config>
-  env EXTERNALGRPC_URL={{ include "binarylane-controller.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.autoscalerPort }}
+  env EXTERNALGRPC_URL={{ include "binarylane-controller.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ include "binarylane-controller.port" .Values.autoscaler.listenAddr }}
 
 {{- if .Values.mtls.enabled }}
 mTLS is enabled. Client credentials for cluster-autoscaler are in Secret:

@@ -69,13 +69,13 @@ spec:
           {{- if or .Values.autoscaler.enabled .Values.externalDns.enabled }}
           ports:
             {{- if .Values.autoscaler.enabled }}
-            - name: cluster-autoscaler
-              containerPort: 8086
+            - name: autoscaler
+              containerPort: {{ include "binarylane-controller.port" .Values.autoscaler.listenAddr }}
               protocol: TCP
             {{- end }}
             {{- if .Values.externalDns.enabled }}
             - name: external-dns
-              containerPort: 8888
+              containerPort: {{ include "binarylane-controller.port" .Values.externalDns.listenAddr }}
               protocol: TCP
             {{- end }}
           {{- end }}

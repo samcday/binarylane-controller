@@ -10,13 +10,13 @@ spec:
   type: {{ .Values.service.type }}
   ports:
     {{- if .Values.autoscaler.enabled }}
-    - port: {{ .Values.service.autoscalerPort }}
-      targetPort: cluster-autoscaler
+    - port: {{ include "binarylane-controller.port" .Values.autoscaler.listenAddr }}
+      targetPort: autoscaler
       protocol: TCP
-      name: cluster-autoscaler
+      name: autoscaler
     {{- end }}
     {{- if .Values.externalDns.enabled }}
-    - port: {{ .Values.service.externalDnsPort }}
+    - port: {{ include "binarylane-controller.port" .Values.externalDns.listenAddr }}
       targetPort: external-dns
       protocol: TCP
       name: external-dns
