@@ -9,6 +9,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::future::try_join_all;
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
@@ -174,16 +175,25 @@ async fn get_records(
     State(state): State<AppState>,
 ) -> std::result::Result<WebhookJson<Vec<Endpoint>>, AppError> {
     let domains = state.bl.list_domains().await?;
+    let records_by_domain = try_join_all(domains.iter().map(|domain| {
+        let bl = state.bl.clone();
+        let domain_name = domain.name.clone();
+        async move {
+            let records = bl.list_domain_records(&domain_name).await?;
+            Ok::<_, anyhow::Error>((domain_name, records))
+        }
+    }))
+    .await?;
+
     let mut grouped: BTreeMap<(String, String), Endpoint> = BTreeMap::new();
 
-    for domain in domains {
-        let records = state.bl.list_domain_records(&domain.name).await?;
+    for (domain_name, records) in records_by_domain {
         for record in records {
             if !supported_record_type(&record.record_type) {
                 continue;
             }
 
-            let dns_name = record_dns_name(&domain.name, &record.name);
+            let dns_name = record_dns_name(&domain_name, &record.name);
             let key = (dns_name.clone(), record.record_type.clone());
             let endpoint = grouped.entry(key).or_insert_with(|| Endpoint {
                 dns_name,
@@ -364,7 +374,7 @@ fn map_endpoint_to_domain(endpoint: &Endpoint, domains: &[String]) -> Result<(St
     } else {
         dns_name
             .strip_suffix(&format!(".{normalized_domain}"))
-            .unwrap_or_default()
+            .expect("guaranteed by ends_with check above")
             .to_string()
     };
 

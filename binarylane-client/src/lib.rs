@@ -166,23 +166,6 @@ pub struct CreateDomainRecordRequest {
     pub weight: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
-#[allow(dead_code)]
-pub struct UpdateDomainRecordRequest {
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub record_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub priority: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub port: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub weight: Option<i64>,
-}
-
 impl Client {
     pub fn new(token: String) -> Self {
         Self {
@@ -516,35 +499,6 @@ impl Client {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             bail!("creating domain record in {domain}: {status}: {body}");
-        }
-        #[derive(Deserialize)]
-        struct Resp {
-            domain_record: DomainRecord,
-        }
-        let r: Resp = resp.json().await.context("decoding domain record")?;
-        Ok(r.domain_record)
-    }
-
-    #[allow(dead_code)]
-    pub async fn update_domain_record(
-        &self,
-        domain: &str,
-        record_id: i64,
-        req: UpdateDomainRecordRequest,
-    ) -> Result<DomainRecord> {
-        let resp = self
-            .request(
-                reqwest::Method::PUT,
-                &format!("/domains/{domain}/records/{record_id}"),
-            )
-            .json(&req)
-            .send()
-            .await
-            .context("updating domain record")?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("updating domain record {record_id} in {domain}: {status}: {body}");
         }
         #[derive(Deserialize)]
         struct Resp {

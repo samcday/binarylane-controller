@@ -43,13 +43,12 @@ externalDns:
   mtls:
     enabled: true
     clientSecretName: binarylane-controller-external-dns-mtls-client
-  service:
-    type: ClusterIP
-    port: 8888
 
-grpcService:
+service:
   type: ClusterIP
-  port: 8086
+  # Ports exposed by the controller service
+  autoscalerPort: 8086
+  externalDnsPort: 8888
 
 resources:
   requests:

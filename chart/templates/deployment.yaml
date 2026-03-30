@@ -69,12 +69,12 @@ spec:
           {{- if or .Values.autoscaler.enabled .Values.externalDns.enabled }}
           ports:
             {{- if .Values.autoscaler.enabled }}
-            - name: grpc
+            - name: cluster-autoscaler
               containerPort: 8086
               protocol: TCP
             {{- end }}
             {{- if .Values.externalDns.enabled }}
-            - name: webhook
+            - name: external-dns
               containerPort: 8888
               protocol: TCP
             {{- end }}
