@@ -9,7 +9,7 @@ COPY proto/ proto/
 COPY binarylane-client/ binarylane-client/
 
 # Strip xtask and integration-tests from workspace — dev-only, not shipped
-RUN sed -i '/"xtask"/d; /"integration-tests"/d' Cargo.toml
+RUN sed -i 's/, "integration-tests"//; s/, "xtask"//' Cargo.toml
 
 # Create dummy source so cargo can fetch + compile all dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs && \
