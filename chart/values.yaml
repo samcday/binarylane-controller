@@ -20,7 +20,7 @@ serviceAccount:
 
 # Autoscaler gRPC provider configuration
 autoscaler:
-  enabled: true
+  enabled: false
   # Node group configuration (JSON)
   config: {}
   # Cloud-init template
@@ -33,12 +33,28 @@ templateVars: {}
 
 mtls:
   enabled: true
+  # Set to false to skip cert generation (e.g. when secrets are managed externally)
+  generate: true
   # Name of the Secret created with client credentials for cluster-autoscaler
   clientSecretName: binarylane-controller-mtls-client
 
-grpcService:
+# External-DNS webhook provider configuration
+externalDns:
+  enabled: false
+  listenAddr: "0.0.0.0:8888"
+  mtls:
+    # mTLS is enabled by default when external-dns is enabled. Set to false for
+    # plain HTTP, e.g. when the webhook is only reachable within the cluster and
+    # certificate management is not desired. Only disable mTLS when network-level
+    # controls (e.g. NetworkPolicy) prevent unauthorized access to the webhook.
+    enabled: true
+    clientSecretName: binarylane-controller-external-dns-mtls-client
+
+service:
+  # Shared across all controller ports. Both autoscaler and external-dns
+  # endpoints are exposed on a single Service; split into separate Services
+  # if you need different types per port. Ports are derived from listenAddr values.
   type: ClusterIP
-  port: 8086
 
 resources:
   requests:

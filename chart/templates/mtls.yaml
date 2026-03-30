@@ -1,15 +1,45 @@
-{{- if and .Values.autoscaler.enabled .Values.mtls.enabled }}
+{{- if and (or (and .Values.autoscaler.enabled .Values.mtls.enabled) (and .Values.externalDns.enabled .Values.externalDns.mtls.enabled)) (ne (toString .Values.mtls.generate) "false") }}
 {{- $fullname := include "binarylane-controller.fullname" . -}}
 {{- $svcName := printf "%s.%s.svc" $fullname .Release.Namespace -}}
 {{- $svcCluster := printf "%s.%s.svc.cluster.local" $fullname .Release.Namespace -}}
-{{- $ca := genCA "binarylane-controller-ca" 3650 -}}
-{{- $serverCert := genSignedCert $fullname nil (list $svcName $svcCluster "localhost") 3650 $ca -}}
-{{- $clientCert := genSignedCert "cluster-autoscaler" nil nil 3650 $ca -}}
+{{- $serverSecretName := printf "%s-mtls-server" $fullname -}}
+{{- $existingServer := lookup "v1" "Secret" .Release.Namespace $serverSecretName -}}
+{{- $ca := dict -}}
+{{- $serverCert := dict -}}
+{{- if and $existingServer $existingServer.data }}
+{{- /* Reuse the existing CA cert. The CA private key is not stored, so buildCustomCert
+       receives ca.crt as both arguments. This works for reusing the CA identity but cannot
+       sign new client certs — if a client secret is manually deleted while the server secret
+       exists, delete the server secret too to force full cert regeneration. */ -}}
+{{- $ca = buildCustomCert (index $existingServer.data "ca.crt") (index $existingServer.data "ca.crt") -}}
+{{- $serverCert = dict "Cert" (index $existingServer.data "tls.crt" | b64dec) "Key" (index $existingServer.data "tls.key" | b64dec) -}}
+{{- else }}
+{{- $ca = genCA "binarylane-controller-ca" 3650 -}}
+{{- $serverCert = genSignedCert $fullname nil (list $svcName $svcCluster "localhost") 3650 $ca -}}
+{{- end }}
+{{- $clientCert := dict -}}
+{{- $externalDnsClientCert := dict -}}
+{{- if and .Values.autoscaler.enabled .Values.mtls.enabled }}
+{{- $existingClient := lookup "v1" "Secret" .Release.Namespace .Values.mtls.clientSecretName -}}
+{{- if and $existingClient $existingClient.data }}
+{{- $clientCert = dict "Cert" (index $existingClient.data "tls.crt" | b64dec) "Key" (index $existingClient.data "tls.key" | b64dec) -}}
+{{- else }}
+{{- $clientCert = genSignedCert "cluster-autoscaler" nil nil 3650 $ca -}}
+{{- end }}
+{{- end }}
+{{- if and .Values.externalDns.enabled .Values.externalDns.mtls.enabled }}
+{{- $existingEdClient := lookup "v1" "Secret" .Release.Namespace .Values.externalDns.mtls.clientSecretName -}}
+{{- if and $existingEdClient $existingEdClient.data }}
+{{- $externalDnsClientCert = dict "Cert" (index $existingEdClient.data "tls.crt" | b64dec) "Key" (index $existingEdClient.data "tls.key" | b64dec) -}}
+{{- else }}
+{{- $externalDnsClientCert = genSignedCert "external-dns" nil nil 3650 $ca -}}
+{{- end }}
+{{- end }}
 ---
 apiVersion: v1
 kind: Secret
 metadata:
-  name: {{ $fullname }}-mtls-server
+  name: {{ $serverSecretName }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "binarylane-controller.labels" . | nindent 4 }}
@@ -18,6 +48,7 @@ data:
   ca.crt: {{ $ca.Cert | b64enc }}
   tls.crt: {{ $serverCert.Cert | b64enc }}
   tls.key: {{ $serverCert.Key | b64enc }}
+{{- if and .Values.autoscaler.enabled .Values.mtls.enabled }}
 ---
 apiVersion: v1
 kind: Secret
@@ -31,4 +62,20 @@ data:
   ca.crt: {{ $ca.Cert | b64enc }}
   tls.crt: {{ $clientCert.Cert | b64enc }}
   tls.key: {{ $clientCert.Key | b64enc }}
+{{- end }}
+{{- if and .Values.externalDns.enabled .Values.externalDns.mtls.enabled }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.externalDns.mtls.clientSecretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "binarylane-controller.labels" . | nindent 4 }}
+type: Opaque
+data:
+  ca.crt: {{ $ca.Cert | b64enc }}
+  tls.crt: {{ $externalDnsClientCert.Cert | b64enc }}
+  tls.key: {{ $externalDnsClientCert.Key | b64enc }}
+{{- end }}
 {{- end }}
