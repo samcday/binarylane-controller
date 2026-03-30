@@ -1,0 +1,77 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [labeled, synchronize]
+  workflow_dispatch:
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  should-run:
+    runs-on: ubuntu-24.04
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        run: |
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ contains(github.event.pull_request.labels.*.name, 'integration') }}" == "true" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  integration:
+    needs: should-run
+    if: needs.should-run.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [node-lb, autoscaler, external-dns]
+    env:
+      BL_API_TOKEN: ${{ secrets.BL_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install Tilt
+        run: curl -fsSL https://raw.githubusercontent.com/tilt-dev/tilt/master/scripts/install.sh | bash
+
+      - name: Provision control plane
+        run: |
+          output="$(cargo xtask dev-up --server-name ci-${{ github.run_id }}-${{ matrix.suite }})"
+          eval "$output"
+          # Persist exported env vars to GITHUB_ENV for subsequent steps.
+          # dev-up emits lines like: export KEY='value'
+          # After eval, the vars are set in this shell; extract names and write values.
+          while IFS= read -r line; do
+            name="${line#export }"
+            name="${name%%=*}"
+            echo "${name}=${!name}" >> "$GITHUB_ENV"
+          done <<< "$output"
+
+      - name: Deploy stack
+        run: cargo xtask tilt ci
+
+      - name: Run tests
+        run: cargo test -p integration-tests --test ${{ matrix.suite }} -- --test-threads=1
+
+      - name: Teardown
+        if: always()
+        run: cargo xtask dev-down
