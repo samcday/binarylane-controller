@@ -256,6 +256,25 @@ async fn post_records(
     .await?;
     apply_deletes(&state, &domain_names, &changes.delete).await?;
 
+    // Flush nameserver cache for affected domains
+    let mut affected_domains: HashSet<String> = HashSet::new();
+    for endpoint in changes
+        .create
+        .iter()
+        .chain(changes.update_new.iter())
+        .chain(changes.delete.iter())
+    {
+        if let Ok((domain, _)) = map_endpoint_to_domain(endpoint, &domain_names) {
+            affected_domains.insert(domain);
+        }
+    }
+    if !affected_domains.is_empty() {
+        let domain_refs: Vec<&str> = affected_domains.iter().map(String::as_str).collect();
+        if let Err(e) = state.bl.refresh_nameserver_cache(&domain_refs).await {
+            tracing::warn!(error = %e, "failed to refresh nameserver cache");
+        }
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -271,40 +290,46 @@ async fn apply_updates(
     old: &[Endpoint],
     new: &[Endpoint],
 ) -> Result<()> {
-    for endpoint in old {
-        let (domain, record_name) = map_endpoint_to_domain(endpoint, domains)?;
-        let records = state.bl.list_domain_records(&domain).await?;
-        for record in records {
-            if record.name == record_name
-                && record
-                    .record_type
-                    .eq_ignore_ascii_case(&endpoint.record_type)
-            {
-                state.bl.delete_domain_record(&domain, record.id).await?;
-            }
-        }
-    }
+    for (old_ep, new_ep) in old.iter().zip(new.iter()) {
+        let (domain, record_name) = map_endpoint_to_domain(new_ep, domains)?;
+        let old_targets: HashSet<&str> = old_ep.targets.iter().map(String::as_str).collect();
+        let new_targets: HashSet<&str> = new_ep.targets.iter().map(String::as_str).collect();
 
-    for endpoint in new {
-        let (domain, record_name) = map_endpoint_to_domain(endpoint, domains)?;
-        let priority = endpoint_priority(endpoint)?;
-        let port = endpoint_port(endpoint)?;
-        let weight = endpoint_weight(endpoint)?;
-        for target in &endpoint.targets {
+        let to_create: Vec<&str> = new_targets.difference(&old_targets).copied().collect();
+        let to_delete: HashSet<&str> = old_targets.difference(&new_targets).copied().collect();
+
+        // Create new records first (brief overlap is harmless for DNS)
+        let priority = endpoint_priority(new_ep)?;
+        let port = endpoint_port(new_ep)?;
+        let weight = endpoint_weight(new_ep)?;
+        for target in &to_create {
             state
                 .bl
                 .create_domain_record(
                     &domain,
                     binarylane::CreateDomainRecordRequest {
-                        record_type: endpoint.record_type.clone(),
+                        record_type: new_ep.record_type.clone(),
                         name: record_name.clone(),
-                        data: target.clone(),
+                        data: target.to_string(),
                         priority,
                         port,
                         weight,
                     },
                 )
                 .await?;
+        }
+
+        // Then delete old records that are no longer needed
+        if !to_delete.is_empty() {
+            let records = state.bl.list_domain_records(&domain).await?;
+            for record in records {
+                if record.name == record_name
+                    && record.record_type.eq_ignore_ascii_case(&old_ep.record_type)
+                    && to_delete.contains(record.data.as_str())
+                {
+                    state.bl.delete_domain_record(&domain, record.id).await?;
+                }
+            }
         }
     }
 

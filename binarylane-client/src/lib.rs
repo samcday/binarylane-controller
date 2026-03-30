@@ -524,4 +524,23 @@ impl Client {
         }
         Ok(())
     }
+
+    pub async fn refresh_nameserver_cache(&self, domain_names: &[&str]) -> Result<()> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            domain_names: &'a [&'a str],
+        }
+        let resp = self
+            .request(reqwest::Method::POST, "/domains/refresh_nameserver_cache")
+            .json(&Req { domain_names })
+            .send()
+            .await
+            .context("refreshing nameserver cache")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("refreshing nameserver cache: {status}: {body}");
+        }
+        Ok(())
+    }
 }
