@@ -75,14 +75,15 @@ struct ProviderSpecificProperty {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Changes {
-    #[serde(rename = "Create", default)]
+    #[serde(default)]
     create: Vec<Endpoint>,
-    #[serde(rename = "UpdateOld", default)]
+    #[serde(default)]
     update_old: Vec<Endpoint>,
-    #[serde(rename = "UpdateNew", default)]
+    #[serde(default)]
     update_new: Vec<Endpoint>,
-    #[serde(rename = "Delete", default)]
+    #[serde(default)]
     delete: Vec<Endpoint>,
 }
 
@@ -163,9 +164,11 @@ async fn get_root(
     State(state): State<AppState>,
 ) -> std::result::Result<WebhookJson<DomainFilterResponse>, AppError> {
     let domains = state.bl.list_domains().await?;
+    let names: Vec<String> = domains.into_iter().map(|d| d.name).collect();
+    tracing::debug!(domains = ?names, "GET / domain filter");
     Ok(WebhookJson(DomainFilterResponse {
         domain_filter: DomainFilter {
-            include: domains.into_iter().map(|d| d.name).collect(),
+            include: names,
             exclude: Vec::new(),
         },
     }))
@@ -174,6 +177,7 @@ async fn get_root(
 async fn get_records(
     State(state): State<AppState>,
 ) -> std::result::Result<WebhookJson<Vec<Endpoint>>, AppError> {
+    tracing::debug!("GET /records");
     let domains = state.bl.list_domains().await?;
     let records_by_domain = try_join_all(domains.iter().map(|domain| {
         let bl = state.bl.clone();
@@ -214,6 +218,7 @@ async fn get_records(
         endpoint.targets.dedup();
     }
 
+    tracing::debug!(count = endpoints.len(), "GET /records returning");
     Ok(WebhookJson(endpoints))
 }
 
@@ -221,6 +226,12 @@ async fn post_records(
     State(state): State<AppState>,
     Json(changes): Json<Changes>,
 ) -> std::result::Result<StatusCode, AppError> {
+    tracing::info!(
+        create = changes.create.len(),
+        update = changes.update_new.len(),
+        delete = changes.delete.len(),
+        "POST /records"
+    );
     let domains = state.bl.list_domains().await?;
     let domain_names: Vec<String> = domains.iter().map(|d| d.name.clone()).collect();
 
@@ -303,6 +314,7 @@ async fn post_records(
 async fn post_adjust_endpoints(
     Json(endpoints): Json<Vec<Endpoint>>,
 ) -> std::result::Result<WebhookJson<Vec<Endpoint>>, AppError> {
+    tracing::debug!(count = endpoints.len(), "POST /adjustendpoints");
     Ok(WebhookJson(endpoints))
 }
 
