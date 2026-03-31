@@ -74,6 +74,8 @@ pub struct CreateServerRequest {
     pub user_data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_keys: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

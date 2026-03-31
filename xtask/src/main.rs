@@ -232,6 +232,8 @@ struct CreateServerRequest {
     user_data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ssh_keys: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -594,6 +596,8 @@ fn create_dev_server(
         args.server_name, args.region, args.size, args.image, args.ssh_key_name
     );
 
+    let server_password = generate_server_password();
+
     let server = client
         .create_server(CreateServerRequest {
             name: args.server_name.clone(),
@@ -602,6 +606,7 @@ fn create_dev_server(
             region: args.region.clone(),
             user_data: None,
             ssh_keys: Some(vec![ssh_key_fingerprint.to_string()]),
+            password: Some(server_password),
         })
         .with_context(|| {
             "creating BinaryLane server (override defaults with --region/--size/--image if needed)"
@@ -1441,6 +1446,15 @@ fn generate_registry_password() -> String {
         .take(40)
         .map(char::from)
         .collect()
+}
+
+fn generate_server_password() -> String {
+    let random: String = thread_rng()
+        .sample_iter(Alphanumeric)
+        .take(36)
+        .map(char::from)
+        .collect();
+    format!("BlcA1{random}")
 }
 
 fn shell_single_quote(value: &str) -> String {

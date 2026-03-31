@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result};
-use k8s_openapi::api::core::v1::Node;
+use anyhow::{Context, Result, bail};
+use k8s_openapi::api::core::v1::{Node, Secret};
 use kube::{Api, Client as KubeClient, api::PatchParams};
 use tracing::{error, info};
 
@@ -9,9 +9,15 @@ use crate::binarylane::{self, Client as BlClient};
 
 const UNINITIALIZED_TAINT: &str = "node.cloudprovider.kubernetes.io/uninitialized";
 pub const FINALIZER: &str = "blc.samcday.com/server-cleanup";
+const NODE_PASSWORD_SECRET_SUFFIX: &str = "-node-password";
 
-pub async fn reconcile(bl: &BlClient, k8s: &KubeClient) {
+pub fn node_password_secret_name(node_name: &str) -> String {
+    format!("{node_name}{NODE_PASSWORD_SECRET_SUFFIX}")
+}
+
+pub async fn reconcile(bl: &BlClient, k8s: &KubeClient, secret_namespace: &str) {
     let nodes_api: Api<Node> = Api::all(k8s.clone());
+    let secrets_api: Api<Secret> = Api::namespaced(k8s.clone(), secret_namespace);
     let nodes = match nodes_api.list(&Default::default()).await {
         Ok(list) => list,
         Err(e) => {
@@ -30,7 +36,7 @@ pub async fn reconcile(bl: &BlClient, k8s: &KubeClient) {
         let Some(server_id) = binarylane::parse_provider_id(provider_id) else {
             continue;
         };
-        if let Err(e) = reconcile_node(bl, &nodes_api, node, name, server_id).await {
+        if let Err(e) = reconcile_node(bl, &nodes_api, &secrets_api, node, name, server_id).await {
             error!(error = %e, node = name, server_id, "reconciling node");
         }
     }
@@ -39,6 +45,7 @@ pub async fn reconcile(bl: &BlClient, k8s: &KubeClient) {
 async fn reconcile_node(
     bl: &BlClient,
     nodes_api: &Api<Node>,
+    secrets_api: &Api<Secret>,
     node: &Node,
     name: &str,
     server_id: i64,
@@ -59,6 +66,28 @@ async fn reconcile_node(
         bl.delete_server(server_id)
             .await
             .context("deleting server")?;
+
+        let secret_name = node_password_secret_name(name);
+        match secrets_api.delete(&secret_name, &Default::default()).await {
+            Ok(_) => {
+                info!(node = name, secret = %secret_name, "deleted node password secret");
+            }
+            Err(kube::Error::Api(err)) if err.code == 404 => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("deleting node password secret {}", secret_name));
+            }
+        }
+
+        if secrets_api
+            .get_opt(&secret_name)
+            .await
+            .with_context(|| format!("confirming node password secret {} deletion", secret_name))?
+            .is_some()
+        {
+            bail!("node password secret {} still exists", secret_name);
+        }
+
         let patch = serde_json::json!({
             "metadata": {
                 "finalizers": node.metadata.finalizers.as_ref()

@@ -47,6 +47,10 @@ struct Args {
     #[arg(long, env = "EXTERNAL_DNS_LISTEN_ADDR")]
     external_dns_listen_addr: Option<String>,
 
+    /// Namespace the controller runs in (for namespaced Secret reconciliation)
+    #[arg(long, env = "POD_NAMESPACE", default_value = "binarylane-system")]
+    pod_namespace: String,
+
     /// TLS certificate path (enables mTLS when all three TLS args are set)
     #[arg(long, env = "TLS_CERT_PATH")]
     tls_cert_path: Option<String>,
@@ -78,12 +82,13 @@ async fn main() -> Result<()> {
     // Start node controller
     let bl_nc = bl.clone();
     let k8s_nc = k8s.clone();
+    let pod_namespace_nc = args.pod_namespace.clone();
     let node_handle = tokio::spawn(async move {
         info!(interval = ?Duration::from_secs(30), "node controller starting");
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
-            node_controller::reconcile(&bl_nc, &k8s_nc).await;
+            node_controller::reconcile(&bl_nc, &k8s_nc, &pod_namespace_nc).await;
         }
     });
 
@@ -183,7 +188,8 @@ async fn main() -> Result<()> {
         .filter_map(|(k, v)| k.strip_prefix("TMPL_").map(|k| (k.to_string(), v)))
         .collect::<HashMap<_, _>>();
 
-    let provider = autoscaler::Provider::new(bl, k8s.clone(), cfg.clone());
+    let provider =
+        autoscaler::Provider::new(bl, k8s.clone(), cfg.clone(), args.pod_namespace.clone());
     let svc = proto::cloud_provider_server::CloudProviderServer::new(provider);
 
     info!(

@@ -3,14 +3,16 @@ use std::sync::Arc;
 
 use k8s_openapi::api::core::v1::{
     Event as K8sEvent, EventSource, Node as K8sNode, NodeSpec as K8sNodeSpec, ObjectReference,
-    Taint as K8sTaint,
+    Secret as K8sSecret, Taint as K8sTaint,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta as K8sObjectMeta, Time};
 use k8s_pb::api::core::v1::{Node, NodeCondition, NodeSpec, NodeStatus, Taint};
 use k8s_pb::apimachinery::pkg::api::resource::Quantity;
 use k8s_pb::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Api;
+use kube::api::{Patch, PatchParams};
 use prost_014::Message;
+use rand::{Rng, distributions::Alphanumeric, thread_rng};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
@@ -53,15 +55,17 @@ pub struct Provider {
     bl: BlClient,
     k8s: kube::Client,
     cfg: Config,
+    secret_namespace: String,
     servers: Arc<RwLock<HashMap<i64, binarylane::Server>>>,
 }
 
 impl Provider {
-    pub fn new(bl: BlClient, k8s: kube::Client, cfg: Config) -> Self {
+    pub fn new(bl: BlClient, k8s: kube::Client, cfg: Config, secret_namespace: String) -> Self {
         Self {
             bl,
             k8s,
             cfg,
+            secret_namespace,
             servers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -107,6 +111,50 @@ impl Provider {
         );
         labels.extend(ng.labels.clone());
         labels
+    }
+
+    async fn upsert_node_password_secret(
+        &self,
+        node_name: &str,
+        server_id: i64,
+        password: &str,
+    ) -> Result<(), Status> {
+        let secrets_api: Api<K8sSecret> = Api::namespaced(self.k8s.clone(), &self.secret_namespace);
+        let secret_name = crate::node_controller::node_password_secret_name(node_name);
+        let patch = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": secret_name,
+                "labels": {
+                    "app.kubernetes.io/managed-by": "binarylane-controller",
+                    "bl.samcday.com/node-name": node_name,
+                },
+                "annotations": {
+                    "bl.samcday.com/server-id": server_id.to_string(),
+                },
+            },
+            "type": "Opaque",
+            "stringData": {
+                "password": password,
+            },
+        });
+
+        secrets_api
+            .patch(
+                &secret_name,
+                &PatchParams::apply("binarylane-controller").force(),
+                &Patch::Apply(&patch),
+            )
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "upserting node password secret {}/{}: {e}",
+                    self.secret_namespace, secret_name
+                ))
+            })?;
+
+        Ok(())
     }
 }
 
@@ -307,6 +355,7 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
             vars.insert("Region".to_string(), ng.region.clone());
             vars.insert("Size".to_string(), ng.size.clone());
             let user_data = self.render_cloud_init(&vars);
+            let server_password = generate_server_password();
 
             info!(name = %name, size = %ng.size, region = %ng.region, "creating server");
             let srv = self
@@ -322,11 +371,14 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
                     } else {
                         Some(self.cfg.ssh_keys.clone())
                     },
+                    password: Some(server_password.clone()),
                 })
                 .await
                 .map_err(|e| Status::internal(format!("creating server: {e}")))?;
 
             self.servers.write().await.insert(srv.id, srv.clone());
+            self.upsert_node_password_secret(&name, srv.id, &server_password)
+                .await?;
 
             let mut labels = self.node_labels(&ng);
             labels.insert("kubernetes.io/hostname".to_string(), name.clone());
@@ -587,6 +639,16 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
     ) -> Result<Response<proto::NodeGroupAutoscalingOptionsResponse>, Status> {
         Err(Status::unimplemented("not implemented"))
     }
+}
+
+fn generate_server_password() -> String {
+    let mut rng = thread_rng();
+    let suffix: String = (&mut rng)
+        .sample_iter(Alphanumeric)
+        .take(36)
+        .map(char::from)
+        .collect();
+    format!("BlcA1{suffix}")
 }
 
 fn chrono_like_timestamp() -> String {
