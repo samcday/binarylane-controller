@@ -62,7 +62,8 @@ jobs:
 
       - name: Provision control plane
         run: |
-          output="$(cargo xtask dev-up --region bne --server-name ci-${{ github.run_id }}-${{ matrix.suite }})"
+          server_name="ci-${{ github.run_id }}-${{ matrix.suite }}"
+          output="$(cargo xtask dev-up --region bne --server-name "$server_name" --ssh-key-name "binarylane-dev-key-$server_name")"
           eval "$output"
           # Persist exported env vars to GITHUB_ENV for subsequent steps.
           # dev-up emits lines like: export KEY='value'
