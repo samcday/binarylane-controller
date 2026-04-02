@@ -61,11 +61,11 @@ jobs:
         run: curl -fsSL https://raw.githubusercontent.com/tilt-dev/tilt/v0.33.22/scripts/install.sh | bash
 
       - name: Provision control plane
+        env:
+          SUITE: ${{ matrix.suite }}
         run: |
           server_name="ci-${{ github.run_id }}-${SUITE//_/-}"
           output="$(cargo xtask dev-up --region bne --server-name "$server_name" --ssh-key-name "binarylane-dev-key-$server_name")"
-        env:
-          SUITE: ${{ matrix.suite }}
           eval "$output"
           # Persist exported env vars to GITHUB_ENV for subsequent steps.
           # dev-up emits lines like: export KEY='value'
