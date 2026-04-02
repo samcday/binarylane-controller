@@ -62,7 +62,7 @@ jobs:
 
       - name: Provision control plane
         run: |
-          output="$(cargo xtask dev-up --server-name ci-${{ github.run_id }}-${{ matrix.suite }})"
+          output="$(cargo xtask dev-up --region bne --server-name ci-${{ github.run_id }}-${{ matrix.suite }})"
           eval "$output"
           # Persist exported env vars to GITHUB_ENV for subsequent steps.
           # dev-up emits lines like: export KEY='value'
