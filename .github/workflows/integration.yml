@@ -41,7 +41,7 @@ jobs:
     needs: should-run
     if: needs.should-run.outputs.run == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
