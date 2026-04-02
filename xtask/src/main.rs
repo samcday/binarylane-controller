@@ -357,6 +357,7 @@ fn apply_instance_overrides_down(args: &mut DevDownArgs) {
 }
 
 fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
+    let t_total = Instant::now();
     apply_instance_overrides_up(&mut args);
     ensure_tool("ssh", "install OpenSSH client")?;
     ensure_tool("ssh-keygen", "install OpenSSH tools")?;
@@ -422,7 +423,9 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     state.tilt_values_path = Some(path_to_string(&tilt_values_out)?);
     save_state(&args.state_file, &state)?;
 
+    let t = Instant::now();
     server = wait_for_server_active(&client, server.id, timeout)?;
+    eprintln!("  server active ........... {:.1}s", t.elapsed().as_secs_f64());
     let server_ip = server
         .public_ipv4()
         .ok_or_else(|| anyhow::anyhow!("server {} has no public IPv4", server.id))?;
@@ -462,6 +465,7 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         }
     }
 
+    let t = Instant::now();
     let ssh_user = wait_for_ssh_ready(
         &server_ip,
         &ssh_users,
@@ -469,7 +473,9 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         &args.known_hosts,
         timeout,
     )?;
+    eprintln!("  ssh ready ............... {:.1}s", t.elapsed().as_secs_f64());
 
+    let t = Instant::now();
     ensure_k3s_server(
         &server_ip,
         &ssh_user,
@@ -477,6 +483,7 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         &args.known_hosts,
         timeout,
     )?;
+    eprintln!("  k3s ready ............... {:.1}s", t.elapsed().as_secs_f64());
 
     let registry_config = RegistryConfig {
         host: &registry_host,
@@ -486,6 +493,7 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         secret_name: &args.registry_secret_name,
     };
 
+    let t = Instant::now();
     ensure_dev_registry(
         &server_ip,
         &ssh_user,
@@ -494,12 +502,16 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         &registry_config,
         timeout,
     )?;
+    eprintln!("  registry deployed ....... {:.1}s", t.elapsed().as_secs_f64());
+
+    let t = Instant::now();
     wait_for_registry_https(
         &registry_host,
         &registry_username,
         &registry_password,
         timeout,
     )?;
+    eprintln!("  registry https ready .... {:.1}s", t.elapsed().as_secs_f64());
 
     let raw_kubeconfig = read_remote_file(
         &server_ip,
@@ -603,6 +615,7 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     emit_env("TMPL_K3S_URL", &k3s_url);
     emit_env("TMPL_K3S_TOKEN", &k3s_token);
 
+    eprintln!("  total ................... {:.1}s", t_total.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -735,7 +748,12 @@ fn wait_for_server_active(client: &BlClient, server_id: i64, timeout: Duration) 
             .ok_or_else(|| anyhow::anyhow!("server id={} disappeared while waiting", server_id))?;
 
         if server.status != last_status {
-            eprintln!("Server id={} status={}", server_id, server.status);
+            eprintln!(
+                "Server id={} status={} ({:.0}s)",
+                server_id,
+                server.status,
+                start.elapsed().as_secs_f64()
+            );
             last_status = server.status.clone();
         }
 
@@ -1089,12 +1107,28 @@ fn wait_for_registry_https(
             .basic_auth(registry_username, Some(registry_password))
             .send();
 
-        if let Ok(resp) = resp {
-            if resp.status().is_success() {
-                eprintln!("Registry endpoint is reachable");
+        match resp {
+            Ok(resp) if resp.status().is_success() => {
+                eprintln!(
+                    "Registry endpoint is reachable ({:.0}s)",
+                    start.elapsed().as_secs_f64()
+                );
                 return Ok(());
             }
-            eprintln!("Registry probe returned status {}", resp.status());
+            Ok(resp) => {
+                eprintln!(
+                    "Registry probe: status {} ({:.0}s)",
+                    resp.status(),
+                    start.elapsed().as_secs_f64()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "Registry probe: {} ({:.0}s)",
+                    e,
+                    start.elapsed().as_secs_f64()
+                );
+            }
         }
 
         if start.elapsed() > timeout {
