@@ -27,11 +27,22 @@ pub async fn reconcile(ctx: &ReconcileContext) {
             .as_ref()
             .and_then(|s| s.provider_id.as_deref())
             .unwrap_or("");
-        let Some(server_id) = binarylane::parse_provider_id(provider_id) else {
+        let server_id = binarylane::parse_provider_id(provider_id);
+
+        let has_finalizer = node
+            .metadata
+            .finalizers
+            .as_ref()
+            .is_some_and(|f| f.iter().any(|f| f == FINALIZER));
+
+        // Process nodes that either have a BL provider ID or have our finalizer
+        // (e.g. provisioning nodes that haven't been bound yet).
+        if server_id.is_none() && !has_finalizer {
             continue;
-        };
+        }
+
         if let Err(e) = reconcile_node(ctx, &nodes_api, &secrets_api, node, name, server_id).await {
-            error!(error = %e, node = name, server_id, "node-deletion: reconciling node");
+            error!(error = %e, node = name, ?server_id, "node-deletion: reconciling node");
         }
     }
 }
@@ -42,7 +53,7 @@ async fn reconcile_node(
     secrets_api: &Api<Secret>,
     node: &Node,
     name: &str,
-    server_id: i64,
+    server_id: Option<i64>,
 ) -> Result<()> {
     let has_finalizer = node
         .metadata
@@ -50,17 +61,17 @@ async fn reconcile_node(
         .as_ref()
         .is_some_and(|f| f.iter().any(|f| f == FINALIZER));
 
-    // Node is being deleted and has our finalizer: delete the BL server,
-    // clean up secrets, then remove the finalizer so the node can be GC'd.
+    // Node is being deleted and has our finalizer: delete the BL server (if
+    // bound), clean up secrets, then remove the finalizer so the node can be GC'd.
     if node.metadata.deletion_timestamp.is_some() && has_finalizer {
-        info!(
-            node = name,
-            server_id, "node deleted, deleting BinaryLane server"
-        );
-        ctx.bl
-            .delete_server(server_id)
-            .await
-            .context("deleting server")?;
+        if let Some(sid) = server_id {
+            info!(
+                node = name,
+                server_id = sid,
+                "node deleted, deleting BinaryLane server"
+            );
+            ctx.bl.delete_server(sid).await.context("deleting server")?;
+        }
 
         delete_secret_if_exists(secrets_api, &node_password_secret_name(name)).await?;
         delete_secret_if_exists(secrets_api, &user_data_secret_name(name)).await?;
@@ -83,25 +94,27 @@ async fn reconcile_node(
         return Ok(());
     }
 
-    // If server no longer exists, clean up secrets then delete the K8s node.
-    let server = ctx
-        .bl
-        .get_server(server_id)
-        .await
-        .context("getting server")?;
-    if server.is_none() {
-        info!(node = name, server_id, "server deleted, removing node");
-        delete_secret_if_exists(secrets_api, &node_password_secret_name(name)).await?;
-        delete_secret_if_exists(secrets_api, &user_data_secret_name(name)).await?;
-        nodes_api
-            .delete(name, &Default::default())
-            .await
-            .context("deleting node")?;
-        return Ok(());
+    // If server is bound but no longer exists, clean up secrets then delete the K8s node.
+    if let Some(sid) = server_id {
+        let server = ctx.bl.get_server(sid).await.context("getting server")?;
+        if server.is_none() {
+            info!(
+                node = name,
+                server_id = sid,
+                "server deleted, removing node"
+            );
+            delete_secret_if_exists(secrets_api, &node_password_secret_name(name)).await?;
+            delete_secret_if_exists(secrets_api, &user_data_secret_name(name)).await?;
+            nodes_api
+                .delete(name, &Default::default())
+                .await
+                .context("deleting node")?;
+            return Ok(());
+        }
     }
 
-    // Ensure finalizer is present.
-    if !has_finalizer {
+    // Ensure finalizer is present (only for bound nodes).
+    if server_id.is_some() && !has_finalizer {
         let mut finalizers: Vec<String> = node.metadata.finalizers.clone().unwrap_or_default();
         finalizers.push(FINALIZER.to_string());
         let patch = serde_json::json!({

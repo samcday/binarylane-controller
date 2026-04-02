@@ -31,6 +31,11 @@ pub async fn reconcile(ctx: &ReconcileContext) {
             continue;
         }
 
+        // Skip nodes being deleted.
+        if node.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+
         // Need all three provision labels.
         let Some(size) = labels.and_then(|l| l.get(LABEL_SIZE)) else {
             continue;
@@ -91,21 +96,36 @@ async fn provision_node(
         .and_then(|d| d.get("user-data"))
         .map(|v| String::from_utf8_lossy(&v.0).to_string());
 
-    info!(node = name, %size, %region, %image, "creating BinaryLane server");
-
-    let srv = ctx
+    // Check for an existing server first to avoid creating duplicates on retry
+    // (e.g. if a previous reconcile created the server but crashed before
+    // patching the Node with the server-id label).
+    let srv = if let Some(existing) = ctx
         .bl
-        .create_server(binarylane::CreateServerRequest {
-            name: name.to_string(),
-            size,
-            image,
-            region,
-            user_data,
-            ssh_keys: None,
-            password,
-        })
+        .get_server_by_hostname(name)
         .await
-        .context("creating server")?;
+        .context("checking for existing server")?
+    {
+        info!(
+            node = name,
+            server_id = existing.id,
+            "reusing existing BinaryLane server"
+        );
+        existing
+    } else {
+        info!(node = name, %size, %region, %image, "creating BinaryLane server");
+        ctx.bl
+            .create_server(binarylane::CreateServerRequest {
+                name: name.to_string(),
+                size,
+                image,
+                region,
+                user_data,
+                ssh_keys: None,
+                password,
+            })
+            .await
+            .context("creating server")?
+    };
 
     // Set providerID and server-id label on the node.
     let patch = serde_json::json!({

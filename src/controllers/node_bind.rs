@@ -5,7 +5,7 @@ use kube::Api;
 use kube::api::PatchParams;
 use tracing::{error, info, warn};
 
-use super::{ANNOTATION_ADOPT, FINALIZER, LABEL_SERVER_ID, ReconcileContext};
+use super::{ANNOTATION_ADOPT, LABEL_SERVER_ID, ReconcileContext};
 
 pub async fn reconcile(ctx: &ReconcileContext) {
     let nodes_api: Api<Node> = Api::all(ctx.k8s.clone());
@@ -66,12 +66,14 @@ async fn bind_node(ctx: &ReconcileContext, nodes_api: &Api<Node>, name: &str) ->
         "binding node to BinaryLane server"
     );
 
+    // Set providerID and server-id label. Finalizer management is handled by
+    // node-deletion, so we don't touch finalizers here to avoid overwriting
+    // any existing ones.
     let patch = serde_json::json!({
         "metadata": {
             "labels": {
                 LABEL_SERVER_ID: server.id.to_string(),
             },
-            "finalizers": [FINALIZER],
         },
         "spec": {
             "providerID": binarylane::server_provider_id(server.id),

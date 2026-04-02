@@ -128,7 +128,7 @@ impl Provider {
             },
             "type": "Opaque",
             "stringData": {
-                data_key: data_value,
+                (data_key): data_value,
             },
         });
 

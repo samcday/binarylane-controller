@@ -217,10 +217,8 @@ impl Client {
 
     pub async fn get_server_by_hostname(&self, hostname: &str) -> Result<Option<Server>> {
         let resp = self
-            .request(
-                reqwest::Method::GET,
-                &format!("/servers?hostname={hostname}"),
-            )
+            .request(reqwest::Method::GET, "/servers")
+            .query(&[("hostname", hostname)])
             .send()
             .await
             .context("getting server by hostname")?;
