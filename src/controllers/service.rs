@@ -1,16 +1,18 @@
 use anyhow::{Context, Result};
+use binarylane_client as binarylane;
 use k8s_openapi::api::core::v1::{Node, Service};
-use kube::{Api, Client as KubeClient, api::PatchParams};
+use kube::api::PatchParams;
+use kube::{Api, Client as KubeClient};
 use tracing::{error, info, warn};
 
-use crate::binarylane::{self, Client as BlClient};
+use super::ReconcileContext;
 
 const ANNOTATION_LB_ID: &str = "binarylane.com.au/load-balancer-id";
 const ANNOTATION_LB_REGION: &str = "binarylane.com.au/load-balancer-region";
 const FINALIZER: &str = "binarylane.com.au/load-balancer";
 
-pub async fn reconcile(bl: &BlClient, k8s: &KubeClient) {
-    let svc_api: Api<Service> = Api::all(k8s.clone());
+pub async fn reconcile(ctx: &ReconcileContext) {
+    let svc_api: Api<Service> = Api::all(ctx.k8s.clone());
     let services = match svc_api.list(&Default::default()).await {
         Ok(list) => list,
         Err(e) => {
@@ -29,21 +31,20 @@ pub async fn reconcile(bl: &BlClient, k8s: &KubeClient) {
         }
         let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
         let name = svc.metadata.name.as_deref().unwrap_or("");
-        if let Err(e) = reconcile_service(bl, k8s, svc, ns, name).await {
+        if let Err(e) = reconcile_service(&ctx.bl, &ctx.k8s, svc, ns, name).await {
             error!(error = %e, service = %format!("{ns}/{name}"), "reconciling service");
         }
     }
 }
 
 async fn reconcile_service(
-    bl: &BlClient,
+    bl: &binarylane::Client,
     k8s: &KubeClient,
     svc: &Service,
     ns: &str,
     name: &str,
 ) -> Result<()> {
     let svc_api: Api<Service> = Api::namespaced(k8s.clone(), ns);
-    let svc_key = format!("{ns}/{name}");
 
     // Handle deletion
     if svc.metadata.deletion_timestamp.is_some() {
@@ -60,9 +61,7 @@ async fn reconcile_service(
         let mut finalizers: Vec<String> = svc.metadata.finalizers.clone().unwrap_or_default();
         finalizers.push(FINALIZER.to_string());
         let patch = serde_json::json!({
-            "metadata": {
-                "finalizers": finalizers
-            }
+            "metadata": { "finalizers": finalizers }
         });
         svc_api
             .patch(
@@ -118,16 +117,9 @@ async fn reconcile_service(
             .await
             .context("getting load balancer")?;
         let Some(existing) = existing else {
-            warn!(lb_id, service = %svc_key, "load balancer not found, recreating");
+            warn!(lb_id, service = %format!("{ns}/{name}"), "load balancer not found, recreating");
             return create_load_balancer(
-                bl,
-                &svc_api,
-                ns,
-                name,
-                region,
-                rules,
-                health_check,
-                node_ids,
+                bl, &svc_api, ns, name, region, rules, health_check, node_ids,
             )
             .await;
         };
@@ -169,22 +161,12 @@ async fn reconcile_service(
         return update_service_status(&svc_api, name, &lb).await;
     }
 
-    create_load_balancer(
-        bl,
-        &svc_api,
-        ns,
-        name,
-        region,
-        rules,
-        health_check,
-        node_ids,
-    )
-    .await
+    create_load_balancer(bl, &svc_api, ns, name, region, rules, health_check, node_ids).await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn create_load_balancer(
-    bl: &BlClient,
+    bl: &binarylane::Client,
     svc_api: &Api<Service>,
     ns: &str,
     name: &str,
@@ -205,7 +187,6 @@ async fn create_load_balancer(
         .await
         .context("creating load balancer")?;
 
-    // Set LB ID annotation
     let patch = serde_json::json!({
         "metadata": {
             "annotations": {
@@ -253,7 +234,7 @@ async fn update_service_status(
 }
 
 async fn handle_deletion(
-    bl: &BlClient,
+    bl: &binarylane::Client,
     svc_api: &Api<Service>,
     svc: &Service,
     ns: &str,
@@ -281,7 +262,6 @@ async fn handle_deletion(
             .context("deleting load balancer")?;
     }
 
-    // Remove finalizer
     let finalizers: Vec<String> = svc
         .metadata
         .finalizers
@@ -294,9 +274,7 @@ async fn handle_deletion(
         })
         .unwrap_or_default();
     let patch = serde_json::json!({
-        "metadata": {
-            "finalizers": finalizers
-        }
+        "metadata": { "finalizers": finalizers }
     });
     svc_api
         .patch(

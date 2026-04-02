@@ -215,6 +215,28 @@ impl Client {
         Ok(Some(r.server))
     }
 
+    pub async fn get_server_by_hostname(&self, hostname: &str) -> Result<Option<Server>> {
+        let resp = self
+            .request(
+                reqwest::Method::GET,
+                &format!("/servers?hostname={hostname}"),
+            )
+            .send()
+            .await
+            .context("getting server by hostname")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("getting server by hostname {hostname}: {status}: {body}");
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            servers: Vec<Server>,
+        }
+        let r: Resp = resp.json().await.context("decoding server")?;
+        Ok(r.servers.into_iter().next())
+    }
+
     pub async fn list_servers(&self) -> Result<Vec<Server>> {
         let mut all = Vec::new();
         let mut page = 1u32;

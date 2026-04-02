@@ -2,10 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use k8s_openapi::api::core::v1::{
-    Event as K8sEvent, EventSource, Node as K8sNode, NodeSpec as K8sNodeSpec, ObjectReference,
-    Secret as K8sSecret, Taint as K8sTaint,
+    Node as K8sNode, NodeSpec as K8sNodeSpec, Secret as K8sSecret, Taint as K8sTaint,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta as K8sObjectMeta, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta as K8sObjectMeta;
 use k8s_pb::api::core::v1::{Node, NodeCondition, NodeSpec, NodeStatus, Taint};
 use k8s_pb::apimachinery::pkg::api::resource::Quantity;
 use k8s_pb::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -17,7 +16,8 @@ use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
-use crate::binarylane::{self, Client as BlClient, CreateServerRequest};
+use crate::binarylane::{self, Client as BlClient};
+use crate::controllers;
 use crate::proto;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -42,8 +42,6 @@ pub struct Config {
     pub node_groups: Vec<NodeGroupConfig>,
     #[serde(skip)]
     pub cloud_init: String,
-    #[serde(default)]
-    pub ssh_keys: Vec<String>,
     #[serde(default)]
     pub name_prefix: String,
     #[serde(skip)]
@@ -112,44 +110,39 @@ impl Provider {
         labels
     }
 
-    async fn upsert_node_password_secret(
+    async fn create_secret(
         &self,
-        node_name: &str,
-        server_id: i64,
-        password: &str,
+        name: &str,
+        data_key: &str,
+        data_value: &str,
     ) -> Result<(), Status> {
         let secrets_api: Api<K8sSecret> = Api::namespaced(self.k8s.clone(), &self.secret_namespace);
-        let secret_name = crate::node_controller::node_password_secret_name(node_name);
         let patch = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Secret",
             "metadata": {
-                "name": secret_name,
+                "name": name,
                 "labels": {
                     "app.kubernetes.io/managed-by": "binarylane-controller",
-                    "bl.samcday.com/node-name": node_name,
-                },
-                "annotations": {
-                    "bl.samcday.com/server-id": server_id.to_string(),
                 },
             },
             "type": "Opaque",
             "stringData": {
-                "password": password,
+                data_key: data_value,
             },
         });
 
         secrets_api
             .patch(
-                &secret_name,
+                name,
                 &PatchParams::apply("binarylane-controller").force(),
                 &Patch::Apply(&patch),
             )
             .await
             .map_err(|e| {
                 Status::internal(format!(
-                    "upserting node password secret {}/{}: {e}",
-                    self.secret_namespace, secret_name
+                    "creating secret {}/{}: {e}",
+                    self.secret_namespace, name
                 ))
             })?;
 
@@ -338,12 +331,10 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
             )));
         }
 
-        // NOTE: if a creation fails mid-loop, already-created servers remain.
-        // The autoscaler's next refresh() will pick them up, but a retry before
-        // refresh could overshoot max_size. Acceptable for now since the BL API
-        // will reject servers beyond account quota anyway.
+        // Create Secrets first (persist data before Node creation), then create
+        // the Node with provision labels. The node-provision reconciler will pick
+        // up the Node on its next cycle and create the BL server.
         let node_api: Api<K8sNode> = Api::all(self.k8s.clone());
-        let events_api: Api<K8sEvent> = Api::namespaced(self.k8s.clone(), "default");
         for i in 0..req.delta {
             let ts = chrono_like_timestamp();
             let name = format!("{}{}-{ts}-{i}", self.cfg.name_prefix, ng.id);
@@ -356,51 +347,46 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
             let user_data = self.render_cloud_init(&vars);
             let server_password = binarylane::generate_server_password();
 
-            // Persist password before server creation so it is not lost if a
-            // later API call fails after BinaryLane accepts the server create.
-            // The initial secret uses a placeholder server ID; we patch it
-            // again with the real ID once create_server returns.
-            self.upsert_node_password_secret(&name, 0, &server_password)
-                .await?;
-
-            info!(name = %name, size = %ng.size, region = %ng.region, "creating server");
-            let srv = self
-                .bl
-                .create_server(CreateServerRequest {
-                    name: name.clone(),
-                    size: ng.size.clone(),
-                    image: ng.image.clone(),
-                    region: ng.region.clone(),
-                    user_data: Some(user_data),
-                    ssh_keys: if self.cfg.ssh_keys.is_empty() {
-                        None
-                    } else {
-                        Some(self.cfg.ssh_keys.clone())
-                    },
-                    password: Some(server_password.clone()),
-                })
-                .await
-                .map_err(|e| Status::internal(format!("creating server: {e}")))?;
-
-            self.servers.write().await.insert(srv.id, srv.clone());
-
-            // Update server-id annotation now that we have the real ID.
-            self.upsert_node_password_secret(&name, srv.id, &server_password)
-                .await?;
+            // Create secrets before Node so data is persisted even if Node
+            // creation fails.
+            self.create_secret(
+                &controllers::node_password_secret_name(&name),
+                "password",
+                &server_password,
+            )
+            .await?;
+            self.create_secret(
+                &controllers::user_data_secret_name(&name),
+                "user-data",
+                &user_data,
+            )
+            .await?;
 
             let mut labels = self.node_labels(&ng);
             labels.insert("kubernetes.io/hostname".to_string(), name.clone());
+            labels.insert(
+                controllers::LABEL_SIZE.to_string(),
+                ng.size.clone(),
+            );
+            labels.insert(
+                controllers::LABEL_REGION.to_string(),
+                ng.region.clone(),
+            );
+            labels.insert(
+                controllers::LABEL_IMAGE.to_string(),
+                ng.image.clone(),
+            );
+
             let node = K8sNode {
                 metadata: K8sObjectMeta {
                     name: Some(name.clone()),
                     labels: Some(labels),
-                    finalizers: Some(vec![crate::node_controller::FINALIZER.to_string()]),
+                    finalizers: Some(vec![controllers::FINALIZER.to_string()]),
                     ..Default::default()
                 },
                 spec: Some(K8sNodeSpec {
-                    provider_id: Some(binarylane::server_provider_id(srv.id)),
                     taints: Some(vec![K8sTaint {
-                        key: "node.cloudprovider.kubernetes.io/uninitialized".to_string(),
+                        key: controllers::UNINITIALIZED_TAINT.to_string(),
                         value: Some("true".to_string()),
                         effect: "NoSchedule".to_string(),
                         ..Default::default()
@@ -409,64 +395,17 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
                 }),
                 status: None,
             };
-            let node_uid = match node_api.create(&Default::default(), &node).await {
-                Ok(created) => {
-                    info!(name = %name, id = srv.id, "pre-created k8s node");
-                    created.metadata.uid
+            match node_api.create(&Default::default(), &node).await {
+                Ok(_) => {
+                    info!(name = %name, "created k8s node for provisioning");
                 }
                 Err(kube::Error::Api(err)) if err.code == 409 => {
-                    info!(name = %name, id = srv.id, "k8s node already exists");
-                    node_api.get(&name).await.ok().and_then(|n| n.metadata.uid)
+                    info!(name = %name, "k8s node already exists");
                 }
                 Err(e) => {
-                    tracing::warn!(name = %name, id = srv.id, error = %e, "failed to pre-create k8s node");
-                    None
+                    return Err(Status::internal(format!("creating k8s node {name}: {e}")));
                 }
-            };
-
-            // Use core v1 Event (not events.k8s.io/v1) with source/involvedObject
-            // fields — this is what kubelet and node-controller use, and what k9s
-            // filters on when showing events for a Node.
-            let now = Time(k8s_openapi::chrono::Utc::now());
-            let event = K8sEvent {
-                metadata: K8sObjectMeta {
-                    generate_name: Some("binarylane-controller-".to_string()),
-                    namespace: Some("default".to_string()),
-                    ..Default::default()
-                },
-                involved_object: ObjectReference {
-                    api_version: Some("v1".to_string()),
-                    kind: Some("Node".to_string()),
-                    name: Some(name.clone()),
-                    uid: node_uid,
-                    ..Default::default()
-                },
-                reason: Some("ServerCreated".to_string()),
-                message: Some(format!(
-                    "Created BinaryLane server {} ({}, {})",
-                    srv.id, ng.size, ng.region
-                )),
-                type_: Some("Normal".to_string()),
-                source: Some(EventSource {
-                    component: Some("binarylane-controller".to_string()),
-                    ..Default::default()
-                }),
-                first_timestamp: Some(now.clone()),
-                last_timestamp: Some(now),
-                count: Some(1),
-                action: Some("ScaleUp".to_string()),
-                ..Default::default()
-            };
-            if let Err(e) = events_api.create(&Default::default(), &event).await {
-                tracing::warn!(
-                    name = %name,
-                    id = srv.id,
-                    error = %e,
-                    "failed to emit server created event"
-                );
             }
-
-            info!(name = %name, id = srv.id, "created server");
         }
 
         Ok(Response::new(proto::NodeGroupIncreaseSizeResponse {}))

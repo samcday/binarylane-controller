@@ -4,10 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-A Kubernetes cloud provider controller for BinaryLane (Australian VPS provider). Three responsibilities:
-1. **Node controller** - reconciles K8s nodes with BinaryLane servers (syncs addresses/labels/taints, removes nodes for deleted servers)
-2. **Service controller** - manages LoadBalancer-type services by creating/updating/deleting BinaryLane load balancers
-3. **Autoscaler gRPC provider** - implements the K8s cluster-autoscaler external gRPC CloudProvider interface to scale node groups
+A Kubernetes cloud provider controller for BinaryLane (Australian VPS provider). Individually-toggleable reconcilers managed via `--controllers` flag (kube-controller-manager style):
+
+1. **node-sync** - syncs K8s node addresses/labels/taints from BinaryLane server metadata
+2. **node-deletion** - handles node/server cleanup (deletion, orphan removal, finalizer management)
+3. **node-bind** - matches unbound K8s nodes to BinaryLane servers by hostname (opt-in via `bl.samcday.com/adopt` annotation)
+4. **node-provision** - provisions BinaryLane servers for Nodes with provision labels (`bl.samcday.com/size`, `region`, `image`)
+5. **service** - manages LoadBalancer-type services via BinaryLane load balancers
+6. **autoscaler** - gRPC CloudProvider for cluster-autoscaler (creates Node + Secrets, node-provision does the rest)
+7. **dns-webhook** - external-dns webhook provider
 
 ## Build & Run
 
@@ -24,30 +29,40 @@ cargo xtask dev-down                # tear down remote BinaryLane dev control pl
 ## Architecture
 
 ```
-src/main.rs                  Entry point: CLI args, starts controllers + optional gRPC autoscaler
-src/binarylane.rs            REST client for BinaryLane v2 API (servers + load balancers)
-src/node_controller.rs       30s reconciliation loop over K8s nodes with binarylane:/// provider IDs
-src/service_controller.rs    30s reconciliation loop for LoadBalancer services
-src/autoscaler.rs            gRPC CloudProvider: manages node groups, creates/deletes servers
-proto/externalgrpc.proto     Cluster autoscaler external gRPC proto definition
-build.rs                     Compiles proto via tonic-build + protobuf-src
-chart/                       Helm chart for deployment
-xtask/                       Dev workflow automation (remote k3s dev control plane)
+src/main.rs                      Entry point: CLI args, controller selection, conditional spawning
+src/controllers/
+  mod.rs                         Shared types (ReconcileContext), constants, resolve_controllers()
+  node_sync.rs                   Address/label/taint sync from BL server
+  node_deletion.rs               Deletion handling, finalizer management, secret cleanup
+  node_bind.rs                   Hostname-based binding of unbound nodes to BL servers
+  node_provision.rs              BL server provisioning from Node labels + Secrets
+  service.rs                     LoadBalancer service reconciliation
+src/autoscaler.rs                gRPC CloudProvider: creates Node + Secrets for node-provision
+src/dns_webhook.rs               External-DNS webhook server
+proto/externalgrpc.proto         Cluster autoscaler external gRPC proto definition
+build.rs                         Compiles proto via tonic-build
+chart/                           Helm chart for deployment
+xtask/                           Dev workflow automation (remote k3s dev control plane)
+binarylane-client/               REST client crate for BinaryLane v2 API
 ```
 
 ### Key concepts
 
-- **Provider ID format**: `binarylane:///<serverID>` - maps K8s nodes to BinaryLane servers. See `binarylane::server_provider_id()` / `parse_provider_id()`.
+- **Provider ID format**: `binarylane:///<serverID>` - maps K8s nodes to BinaryLane servers. See `binarylane_client::server_provider_id()` / `parse_provider_id()`.
+- **Controller selection**: `--controllers='*'` (default), `--controllers='*,-service'`, `--controllers='node-sync,node-bind'`. Parsed by `controllers::resolve_controllers()`.
+- **Node-driven provisioning**: create a Node with labels `bl.samcday.com/{size,region,image}` + Secrets for password and user-data, and `node-provision` creates the BL server. The autoscaler gRPC is a thin wrapper around this.
+- **Node binding**: annotate a node with `bl.samcday.com/adopt` and `node-bind` will look up the BL server by hostname (`GET /v2/servers?hostname=`).
+- **Labels**: `bl.samcday.com/server-id` (queryable, set after bind/provision), `bl.samcday.com/size`, `bl.samcday.com/region`, `bl.samcday.com/image`.
+- **Associated resources**: Secret `{name}-node-password`, Secret `{name}-user-data`.
 - **Server ownership**: autoscaler identifies managed servers by name prefix (`<namePrefix><groupID>-`).
 - **Cloud-init templating**: simple `{{.Key}}` string replacement with vars from `TMPL_*` env vars plus built-in `NodeName`, `NodeGroup`, `Region`, `Size`.
-- **Thread safety**: autoscaler server cache protected by `tokio::sync::RwLock`.
-- **Node/service controllers** run unconditionally; autoscaler gRPC server only starts if config file exists.
 
 ### Environment variables
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `BL_API_TOKEN` | yes | | BinaryLane API token |
+| `CONTROLLERS` | no | `*` | Controller selection (comma-separated) |
 | `CONFIG_PATH` | no | `/etc/binarylane-controller/config.json` | Autoscaler node group config |
 | `CLOUD_INIT_PATH` | no | `/etc/binarylane-controller/cloud-init.sh` | Cloud-init template file |
 | `GRPC_LISTEN_ADDR` | no | `0.0.0.0:8086` | gRPC listen address |

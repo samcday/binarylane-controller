@@ -42,6 +42,8 @@ spec:
                 secretKeyRef:
                   name: {{ include "binarylane-controller.secretName" . }}
                   key: {{ .Values.existingSecretKey }}
+            - name: CONTROLLERS
+              value: {{ .Values.controllers | quote }}
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:

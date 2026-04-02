@@ -13,6 +13,11 @@ apiToken: ""
 existingSecret: ""
 existingSecretKey: "BL_API_TOKEN"
 
+# Controller selection: comma-separated list.
+# Use '*' for all defaults, '-name' to exclude.
+# Controllers: node-sync, node-deletion, node-bind, node-provision, service, autoscaler, dns-webhook
+controllers: "*"
+
 serviceAccount:
   create: true
   annotations: {}
