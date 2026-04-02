@@ -1,12 +1,10 @@
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::Result;
 use binarylane_client::DomainRecord;
 use integration_tests::{TestContext, test_name, wait_for};
-use k8s_openapi::api::core::v1::Service;
 use kube::Api;
-use kube::api::{DeleteParams, ObjectMeta, PostParams};
+use kube::api::{DeleteParams, PostParams};
 
 /// Build the FQDN for a domain record (handles bare "@" and empty names).
 fn record_fqdn(record: &DomainRecord, domain: &str) -> String {
@@ -17,6 +15,8 @@ fn record_fqdn(record: &DomainRecord, domain: &str) -> String {
     }
 }
 
+/// Test the external-dns → webhook → BL DNS API integration using
+/// DNSEndpoint CRDs (avoids dependency on working LoadBalancer controller).
 #[tokio::test]
 async fn test_external_dns_record_lifecycle() -> Result<()> {
     let ctx = match TestContext::new().await {
@@ -53,56 +53,64 @@ async fn test_external_dns_record_lifecycle() -> Result<()> {
     // Generate a unique subdomain.
     let subdomain = test_name("dns");
     let hostname = format!("{subdomain}.{domain}");
-    eprintln!("test hostname: {hostname}");
+    let target_ip = "203.0.113.42"; // TEST-NET-3 (RFC 5737), won't conflict
+    eprintln!("test hostname: {hostname} -> {target_ip}");
 
-    // Create a k8s Service of type LoadBalancer with the external-dns annotation.
-    let svc_name = subdomain.clone();
-    let services: Api<Service> = Api::namespaced(ctx.kube.clone(), "default");
-
-    let svc = Service {
-        metadata: ObjectMeta {
-            name: Some(svc_name.clone()),
-            annotations: Some(BTreeMap::from([(
-                "external-dns.alpha.kubernetes.io/hostname".to_string(),
-                hostname.clone(),
-            )])),
-            ..Default::default()
+    // Create a DNSEndpoint CRD resource. This is consumed by external-dns's
+    // CRD source, which then pushes the record through our webhook provider.
+    let endpoints: Api<kube::api::DynamicObject> = Api::namespaced_with(
+        ctx.kube.clone(),
+        "default",
+        &kube::discovery::ApiResource {
+            group: "externaldns.k8s.io".into(),
+            version: "v1alpha1".into(),
+            api_version: "externaldns.k8s.io/v1alpha1".into(),
+            kind: "DNSEndpoint".into(),
+            plural: "dnsendpoints".into(),
         },
-        spec: Some(k8s_openapi::api::core::v1::ServiceSpec {
-            type_: Some("LoadBalancer".to_string()),
-            ports: Some(vec![k8s_openapi::api::core::v1::ServicePort {
-                port: 80,
-                target_port: Some(
-                    k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(80),
-                ),
-                protocol: Some("TCP".to_string()),
-                ..Default::default()
-            }]),
-            selector: Some(BTreeMap::from([(
-                "app".to_string(),
-                "blctest-external-dns-dummy".to_string(),
-            )])),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    );
 
-    services.create(&PostParams::default(), &svc).await?;
-    eprintln!("created test service: {svc_name}");
+    let endpoint: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
+        "apiVersion": "externaldns.k8s.io/v1alpha1",
+        "kind": "DNSEndpoint",
+        "metadata": {
+            "name": subdomain,
+            "namespace": "default"
+        },
+        "spec": {
+            "endpoints": [{
+                "dnsName": hostname,
+                "recordTTL": 300,
+                "recordType": "A",
+                "targets": [target_ip]
+            }]
+        }
+    }))?;
 
-    // Cleanup helper: delete service and leftover DNS records on exit.
-    let cleanup = |ctx: &TestContext, svc_name: &str, domain: &str, hostname: &str| {
+    endpoints.create(&PostParams::default(), &endpoint).await?;
+    eprintln!("created DNSEndpoint: {subdomain}");
+
+    // Cleanup helper: delete DNSEndpoint and leftover DNS records.
+    let cleanup = |ctx: &TestContext, name: &str, domain: &str, hostname: &str| {
         let bl = ctx.bl.clone();
         let kube = ctx.kube.clone();
-        let svc_name = svc_name.to_string();
+        let name = name.to_string();
         let domain = domain.to_string();
         let hostname = hostname.to_string();
         async move {
-            // Delete the service (ignore errors).
-            let services: Api<Service> = Api::namespaced(kube, "default");
-            let _ = services.delete(&svc_name, &DeleteParams::default()).await;
+            let endpoints: Api<kube::api::DynamicObject> = Api::namespaced_with(
+                kube,
+                "default",
+                &kube::discovery::ApiResource {
+                    group: "externaldns.k8s.io".into(),
+                    version: "v1alpha1".into(),
+                    api_version: "externaldns.k8s.io/v1alpha1".into(),
+                    kind: "DNSEndpoint".into(),
+                    plural: "dnsendpoints".into(),
+                },
+            );
+            let _ = endpoints.delete(&name, &DeleteParams::default()).await;
 
-            // Clean up any leftover DNS records.
             if let Ok(records) = bl.list_domain_records(&domain).await {
                 for record in records {
                     let fqdn = record_fqdn(&record, &domain);
@@ -110,7 +118,6 @@ async fn test_external_dns_record_lifecycle() -> Result<()> {
                         && (record.record_type == "A"
                             || (record.record_type == "TXT"
                                 && record.data.contains("heritage=external-dns")));
-
                     if is_ours {
                         eprintln!(
                             "cleanup: deleting record {} ({} {})",
@@ -123,14 +130,14 @@ async fn test_external_dns_record_lifecycle() -> Result<()> {
         }
     };
 
-    // Wait for the A record to appear.
-    let bl_wait_a = ctx.bl.clone();
-    let domain_a = domain.clone();
-    let hostname_a = hostname.clone();
+    // Wait for the A record to appear in the BL DNS API.
+    let bl_wait = ctx.bl.clone();
+    let domain_wait = domain.clone();
+    let hostname_wait = hostname.clone();
     let wait_result = wait_for(Duration::from_secs(120), Duration::from_secs(5), || {
-        let bl = bl_wait_a.clone();
-        let domain = domain_a.clone();
-        let hostname = hostname_a.clone();
+        let bl = bl_wait.clone();
+        let domain = domain_wait.clone();
+        let hostname = hostname_wait.clone();
         async move {
             let records = bl.list_domain_records(&domain).await?;
             let has_a = records
@@ -143,36 +150,47 @@ async fn test_external_dns_record_lifecycle() -> Result<()> {
 
     if let Err(e) = &wait_result {
         eprintln!("A record wait failed: {e}");
-        cleanup(&ctx, &svc_name, domain, &hostname).await;
+        cleanup(&ctx, &subdomain, domain, &hostname).await;
         return Err(wait_result.unwrap_err());
     }
     eprintln!("A record appeared for {hostname}");
 
-    // Check for TXT ownership record (created by external-dns alongside the A record).
+    // Verify the A record points to the correct IP.
     let records = ctx.bl.list_domain_records(domain).await?;
+    let a_record = records
+        .iter()
+        .find(|r| r.record_type == "A" && record_fqdn(r, domain) == hostname);
+    if let Some(a) = a_record {
+        assert_eq!(
+            a.data, target_ip,
+            "A record should point to {target_ip}, got {}",
+            a.data
+        );
+        eprintln!("A record verified: {} -> {}", hostname, a.data);
+    }
+
+    // Check for TXT ownership record.
     let has_txt = records.iter().any(|r| {
         r.record_type == "TXT"
             && record_fqdn(r, domain) == hostname
             && r.data.contains("heritage=external-dns")
     });
-    if !has_txt {
-        eprintln!(
-            "warning: no TXT ownership record found for {hostname} (some external-dns configs may not create these)"
-        );
-    } else {
+    if has_txt {
         eprintln!("TXT ownership record found for {hostname}");
     }
 
-    // Delete the k8s service.
-    services.delete(&svc_name, &DeleteParams::default()).await?;
-    eprintln!("deleted test service: {svc_name}");
+    // Delete the DNSEndpoint.
+    endpoints
+        .delete(&subdomain, &DeleteParams::default())
+        .await?;
+    eprintln!("deleted DNSEndpoint: {subdomain}");
 
     // Wait for DNS records to be cleaned up.
-    let bl_wait_del = ctx.bl.clone();
+    let bl_del = ctx.bl.clone();
     let domain_del = domain.clone();
     let hostname_del = hostname.clone();
     let del_result = wait_for(Duration::from_secs(120), Duration::from_secs(5), || {
-        let bl = bl_wait_del.clone();
+        let bl = bl_del.clone();
         let domain = domain_del.clone();
         let hostname = hostname_del.clone();
         async move {
@@ -188,7 +206,7 @@ async fn test_external_dns_record_lifecycle() -> Result<()> {
 
     if let Err(e) = &del_result {
         eprintln!("DNS cleanup wait failed: {e}");
-        cleanup(&ctx, &svc_name, domain, &hostname).await;
+        cleanup(&ctx, &subdomain, domain, &hostname).await;
         return Err(del_result.unwrap_err());
     }
 

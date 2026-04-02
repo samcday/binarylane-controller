@@ -45,7 +45,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: ${{ github.event.inputs.suite && fromJSON(format('["{0}"]', github.event.inputs.suite)) || fromJSON('["node-lb","autoscaler","external-dns"]') }}
+        suite: ${{ github.event.inputs.suite && fromJSON(format('["{0}"]', github.event.inputs.suite)) || fromJSON('["node_lb","autoscaler","external_dns"]') }}
     env:
       BL_API_TOKEN: ${{ secrets.BL_API_TOKEN }}
     steps:
