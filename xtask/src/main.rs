@@ -422,7 +422,10 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
 
     let t = Instant::now();
     server = wait_for_server_active(&client, server.id, timeout)?;
-    eprintln!("  server active ........... {:.1}s", t.elapsed().as_secs_f64());
+    eprintln!(
+        "  server active ........... {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
     let server_ip = server
         .public_ipv4()
         .ok_or_else(|| anyhow::anyhow!("server {} has no public IPv4", server.id))?;
@@ -466,7 +469,10 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         &args.known_hosts,
         timeout,
     )?;
-    eprintln!("  ssh ready ............... {:.1}s", t.elapsed().as_secs_f64());
+    eprintln!(
+        "  ssh ready ............... {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
 
     let k3s_registry = K3sRegistryConfig {
         host: &registry_host,
@@ -483,7 +489,10 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         &k3s_registry,
         timeout,
     )?;
-    eprintln!("  k3s ready ............... {:.1}s", t.elapsed().as_secs_f64());
+    eprintln!(
+        "  k3s ready ............... {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
 
     let registry_config = RegistryConfig {
         host: &registry_host,
@@ -502,7 +511,10 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         &registry_config,
         timeout,
     )?;
-    eprintln!("  registry deployed ....... {:.1}s", t.elapsed().as_secs_f64());
+    eprintln!(
+        "  registry deployed ....... {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
 
     let t = Instant::now();
     wait_for_registry(
@@ -511,7 +523,10 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         &registry_password,
         timeout,
     )?;
-    eprintln!("  registry http ready ..... {:.1}s", t.elapsed().as_secs_f64());
+    eprintln!(
+        "  registry http ready ..... {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
 
     let raw_kubeconfig = read_remote_file(
         &server_ip,
@@ -615,7 +630,10 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     emit_env("TMPL_K3S_URL", &k3s_url);
     emit_env("TMPL_K3S_TOKEN", &k3s_token);
 
-    eprintln!("  total ................... {:.1}s", t_total.elapsed().as_secs_f64());
+    eprintln!(
+        "  total ................... {:.1}s",
+        t_total.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -864,8 +882,7 @@ elif [ \"$k3s_was_active\" -eq 1 ]; then\n\
   ${{SUDO}} systemctl restart k3s\n\
 fi\n\
 ${{SUDO}} systemctl enable --now k3s >/dev/null 2>&1 || true\n\
-${{SUDO}} systemctl is-active --quiet k3s\n"
-    ,
+${{SUDO}} systemctl is-active --quiet k3s\n",
         registries_yaml = registries_yaml,
     );
 
