@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use binarylane_client as binarylane;
-use k8s_openapi::api::core::v1::{Node, Secret};
+use k8s_openapi::api::core::v1::{Event, EventSource, Node, ObjectReference, Secret};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::Api;
 use kube::api::PatchParams;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::{
     LABEL_IMAGE, LABEL_REGION, LABEL_SERVER_ID, LABEL_SIZE, ReconcileContext,
@@ -146,6 +147,47 @@ async fn provision_node(
         )
         .await
         .context("patching node with provider ID")?;
+
+    // Emit a K8s Event on the Node so it's visible in `kubectl describe node`.
+    let events_api: Api<Event> = Api::namespaced(ctx.k8s.clone(), "default");
+    let node_uid = nodes_api
+        .get(name)
+        .await
+        .ok()
+        .and_then(|n| n.metadata.uid);
+    let now = Time(k8s_openapi::chrono::Utc::now());
+    let event = Event {
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            generate_name: Some("binarylane-controller-".to_string()),
+            namespace: Some("default".to_string()),
+            ..Default::default()
+        },
+        involved_object: ObjectReference {
+            api_version: Some("v1".to_string()),
+            kind: Some("Node".to_string()),
+            name: Some(name.to_string()),
+            uid: node_uid,
+            ..Default::default()
+        },
+        reason: Some("ServerCreated".to_string()),
+        message: Some(format!(
+            "Created BinaryLane server {} ({}, {})",
+            srv.id, srv.size_slug, srv.region.slug
+        )),
+        type_: Some("Normal".to_string()),
+        source: Some(EventSource {
+            component: Some("binarylane-controller".to_string()),
+            ..Default::default()
+        }),
+        first_timestamp: Some(now.clone()),
+        last_timestamp: Some(now),
+        count: Some(1),
+        action: Some("Provision".to_string()),
+        ..Default::default()
+    };
+    if let Err(e) = events_api.create(&Default::default(), &event).await {
+        warn!(node = name, error = %e, "failed to emit ServerCreated event");
+    }
 
     info!(node = name, server_id = srv.id, "provisioned server");
     Ok(())
