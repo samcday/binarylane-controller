@@ -24,7 +24,7 @@ fn config_hash(labels: Option<&std::collections::BTreeMap<String, String>>) -> S
                 .unwrap_or("")
         })
         .collect::<Vec<_>>()
-        .join("\0")
+        .join("|")
 }
 
 pub async fn reconcile(ctx: &ReconcileContext) {
