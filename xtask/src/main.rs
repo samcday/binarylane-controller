@@ -24,8 +24,6 @@ const DEFAULT_REGISTRY_USERNAME: &str = "dev";
 const DEFAULT_REGISTRY_SECRET_NAME: &str = "dev-registry-cred";
 const REGISTRY_NAMESPACE: &str = "binarylane-dev-registry";
 const REGISTRY_DATA_HOSTPATH: &str = "/var/lib/binarylane-dev-registry/registry-data";
-const REGISTRY_TLS_DATA_HOSTPATH: &str = "/var/lib/binarylane-dev-registry/caddy-data";
-const REGISTRY_TLS_CONFIG_HOSTPATH: &str = "/var/lib/binarylane-dev-registry/caddy-config";
 const DEV_AUTOSCALER_GROUP_ID: &str = "workers";
 
 const DEFAULT_REGION: &str = "syd";
@@ -210,7 +208,6 @@ struct Server {
     id: i64,
     name: String,
     status: String,
-    permalink: Option<String>,
     networks: Networks,
 }
 
@@ -429,12 +426,7 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     let server_ip = server
         .public_ipv4()
         .ok_or_else(|| anyhow::anyhow!("server {} has no public IPv4", server.id))?;
-    let registry_host = server.registry_host().ok_or_else(|| {
-        anyhow::anyhow!(
-            "server {} has no permalink hostname for public dev registry",
-            server.id
-        )
-    })?;
+    let registry_host = format!("{}:30500", server_ip);
 
     // Keep the previously persisted username when present so repeated runs remain idempotent.
     let registry_username = if state.registry_username.trim().is_empty() {
@@ -449,6 +441,7 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     // Cost 4 (minimum) is fine for a dev-only registry credential.
     let registry_password_bcrypt =
         hash(&registry_password, 4).context("hashing registry password for basic auth")?;
+    let registry_htpasswd = format!("{}:{}\n", registry_username, registry_password_bcrypt);
 
     state.registry_host = Some(registry_host.clone());
     state.registry_username = registry_username.clone();
@@ -475,12 +468,19 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     )?;
     eprintln!("  ssh ready ............... {:.1}s", t.elapsed().as_secs_f64());
 
+    let k3s_registry = K3sRegistryConfig {
+        host: &registry_host,
+        username: &registry_username,
+        password: &registry_password,
+    };
+
     let t = Instant::now();
     ensure_k3s_server(
         &server_ip,
         &ssh_user,
         Some(&ssh_key_path),
         &args.known_hosts,
+        &k3s_registry,
         timeout,
     )?;
     eprintln!("  k3s ready ............... {:.1}s", t.elapsed().as_secs_f64());
@@ -489,7 +489,7 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         host: &registry_host,
         username: &registry_username,
         password: &registry_password,
-        password_bcrypt: &registry_password_bcrypt,
+        htpasswd: &registry_htpasswd,
         secret_name: &args.registry_secret_name,
     };
 
@@ -505,13 +505,13 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     eprintln!("  registry deployed ....... {:.1}s", t.elapsed().as_secs_f64());
 
     let t = Instant::now();
-    wait_for_registry_https(
+    wait_for_registry(
         &registry_host,
         &registry_username,
         &registry_password,
         timeout,
     )?;
-    eprintln!("  registry https ready .... {:.1}s", t.elapsed().as_secs_f64());
+    eprintln!("  registry http ready ..... {:.1}s", t.elapsed().as_secs_f64());
 
     let raw_kubeconfig = read_remote_file(
         &server_ip,
@@ -818,11 +818,18 @@ fn ensure_k3s_server(
     user: &str,
     ssh_key_path: Option<&Path>,
     known_hosts: &Path,
+    registry: &K3sRegistryConfig<'_>,
     timeout: Duration,
 ) -> Result<()> {
     eprintln!("Installing/verifying k3s control plane on {}...", host);
     let start = Instant::now();
     let k3s_url = format!("https://{}:6443", host);
+    let registries_yaml = format!(
+        "mirrors:\n  \"{registry_host}\":\n    endpoint:\n      - \"http://{registry_host}\"\nconfigs:\n  \"{registry_host}\":\n    auth:\n      username: {registry_username}\n      password: {registry_password}\n",
+        registry_host = registry.host,
+        registry_username = registry.username,
+        registry_password = registry.password,
+    );
     let install_script = format!(
         "set -eu\n\
 if command -v cloud-init >/dev/null 2>&1; then\n\
@@ -832,6 +839,14 @@ if [ \"$(id -u)\" -eq 0 ]; then\n\
   SUDO=\"\"\n\
 else\n\
   SUDO=\"sudo\"\n\
+fi\n\
+${{SUDO}} mkdir -p /etc/rancher/k3s\n\
+cat <<'EOF_REGISTRIES' | ${{SUDO}} tee /etc/rancher/k3s/registries.yaml >/dev/null\n\
+{registries_yaml}\
+EOF_REGISTRIES\n\
+k3s_was_active=0\n\
+if ${{SUDO}} systemctl is-active --quiet k3s; then\n\
+  k3s_was_active=1\n\
 fi\n\
 if ! command -v curl >/dev/null 2>&1; then\n\
   if command -v apt-get >/dev/null 2>&1; then\n\
@@ -845,9 +860,13 @@ if ! command -v curl >/dev/null 2>&1; then\n\
 fi\n\
 if ! command -v k3s >/dev/null 2>&1; then\n\
   curl -sfL https://get.k3s.io | ${{SUDO}} env INSTALL_K3S_EXEC='server --write-kubeconfig-mode 644 --disable traefik --tls-san {host}' sh -s -\n\
+elif [ \"$k3s_was_active\" -eq 1 ]; then\n\
+  ${{SUDO}} systemctl restart k3s\n\
 fi\n\
 ${{SUDO}} systemctl enable --now k3s >/dev/null 2>&1 || true\n\
 ${{SUDO}} systemctl is-active --quiet k3s\n"
+    ,
+        registries_yaml = registries_yaml,
     );
 
     loop {
@@ -878,8 +897,14 @@ struct RegistryConfig<'a> {
     host: &'a str,
     username: &'a str,
     password: &'a str,
-    password_bcrypt: &'a str,
+    htpasswd: &'a str,
     secret_name: &'a str,
+}
+
+struct K3sRegistryConfig<'a> {
+    host: &'a str,
+    username: &'a str,
+    password: &'a str,
 }
 
 fn ensure_dev_registry(
@@ -891,7 +916,7 @@ fn ensure_dev_registry(
     timeout: Duration,
 ) -> Result<()> {
     eprintln!(
-        "Deploying authenticated dev registry at https://{}...",
+        "Deploying authenticated dev registry at http://{}...",
         registry.host
     );
 
@@ -920,12 +945,22 @@ spec:
         - name: registry
           image: registry:2
           imagePullPolicy: IfNotPresent
+          env:
+            - name: REGISTRY_AUTH
+              value: htpasswd
+            - name: REGISTRY_AUTH_HTPASSWD_REALM
+              value: dev
+            - name: REGISTRY_AUTH_HTPASSWD_PATH
+              value: /auth/htpasswd
           ports:
             - containerPort: 5000
               name: http
           volumeMounts:
             - name: data
               mountPath: /var/lib/registry
+            - name: auth
+              mountPath: /auth/htpasswd
+              subPath: htpasswd
           securityContext:
             runAsUser: 0
             runAsGroup: 0
@@ -934,6 +969,19 @@ spec:
           hostPath:
             path: {registry_data_hostpath}
             type: DirectoryOrCreate
+        - name: auth
+          secret:
+            secretName: registry-auth
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: registry-auth
+  namespace: {ns}
+type: Opaque
+stringData:
+  htpasswd: |
+{registry_htpasswd}
 ---
 apiVersion: v1
 kind: Service
@@ -941,84 +989,18 @@ metadata:
   name: registry
   namespace: {ns}
 spec:
+  type: NodePort
   selector:
     app: registry
   ports:
     - name: http
       port: 5000
       targetPort: 5000
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: registry-gateway-caddyfile
-  namespace: {ns}
-data:
-  Caddyfile: |
-    https://{registry_host} {{
-      basic_auth {{
-        {registry_username} {registry_password_bcrypt}
-      }}
-      reverse_proxy registry.{ns}.svc.cluster.local:5000
-    }}
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: registry-gateway
-  namespace: {ns}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: registry-gateway
-  template:
-    metadata:
-      labels:
-        app: registry-gateway
-    spec:
-      hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
-      containers:
-        - name: caddy
-          image: caddy:2.9-alpine
-          imagePullPolicy: IfNotPresent
-          ports:
-            - containerPort: 80
-              name: http
-            - containerPort: 443
-              name: https
-          volumeMounts:
-            - name: caddyfile
-              mountPath: /etc/caddy/Caddyfile
-              subPath: Caddyfile
-            - name: caddy-data
-              mountPath: /data
-            - name: caddy-config
-              mountPath: /config
-          securityContext:
-            runAsUser: 0
-            runAsGroup: 0
-      volumes:
-        - name: caddyfile
-          configMap:
-            name: registry-gateway-caddyfile
-        - name: caddy-data
-          hostPath:
-            path: {registry_tls_data_hostpath}
-            type: DirectoryOrCreate
-        - name: caddy-config
-          hostPath:
-            path: {registry_tls_config_hostpath}
-            type: DirectoryOrCreate
+      nodePort: 30500
 "#,
         ns = REGISTRY_NAMESPACE,
         registry_data_hostpath = REGISTRY_DATA_HOSTPATH,
-        registry_tls_data_hostpath = REGISTRY_TLS_DATA_HOSTPATH,
-        registry_tls_config_hostpath = REGISTRY_TLS_CONFIG_HOSTPATH,
-        registry_host = registry.host,
-        registry_username = registry.username,
-        registry_password_bcrypt = registry.password_bcrypt,
+        registry_htpasswd = indent_block(registry.htpasswd, 4),
     );
 
     let default_sa_patch = format!(
@@ -1048,7 +1030,6 @@ for ns in default; do
   ${{SUDO}} kubectl -n "$ns" patch serviceaccount default --type='merge' -p={default_sa_patch} >/dev/null
 done
 ${{SUDO}} kubectl -n {registry_ns} rollout status deployment/registry --timeout=300s
-${{SUDO}} kubectl -n {registry_ns} rollout status deployment/registry-gateway --timeout=300s
 "#,
         manifest = manifest,
         registry_ns = REGISTRY_NAMESPACE,
@@ -1084,14 +1065,14 @@ ${{SUDO}} kubectl -n {registry_ns} rollout status deployment/registry-gateway --
     }
 }
 
-fn wait_for_registry_https(
+fn wait_for_registry(
     registry_host: &str,
     registry_username: &str,
     registry_password: &str,
     timeout: Duration,
 ) -> Result<()> {
     eprintln!(
-        "Waiting for registry endpoint https://{}/v2/ ...",
+        "Waiting for registry endpoint http://{}/v2/ ...",
         registry_host
     );
 
@@ -1103,7 +1084,7 @@ fn wait_for_registry_https(
     let start = Instant::now();
     loop {
         let resp = client
-            .get(format!("https://{registry_host}/v2/"))
+            .get(format!("http://{registry_host}/v2/"))
             .basic_auth(registry_username, Some(registry_password))
             .send();
 
@@ -1133,7 +1114,7 @@ fn wait_for_registry_https(
 
         if start.elapsed() > timeout {
             bail!(
-                "timed out waiting for registry endpoint https://{}/v2/",
+                "timed out waiting for registry endpoint http://{}/v2/",
                 registry_host
             );
         }
@@ -1582,6 +1563,17 @@ fn yaml_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+fn indent_block(value: &str, spaces: usize) -> String {
+    let prefix = " ".repeat(spaces);
+    let mut out = String::new();
+    for line in value.lines() {
+        out.push_str(&prefix);
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 fn generate_registry_password() -> String {
     thread_rng()
         .sample_iter(Alphanumeric)
@@ -1650,14 +1642,6 @@ impl Server {
             .iter()
             .find(|n| n.net_type == "public")
             .map(|n| n.ip_address.clone())
-    }
-
-    fn registry_host(&self) -> Option<String> {
-        self.permalink
-            .as_ref()
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty())
-            .map(ToString::to_string)
     }
 }
 
