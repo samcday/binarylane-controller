@@ -26,10 +26,7 @@ if registry_image == "ghcr.io/samcday/binarylane-controller":
 # (incremental cargo build) and CI (cached cargo build).
 custom_build(
     registry_image,
-    'cargo build --release'
-    ' && tar cf /tmp/bl-controller-image.tar -C target/release binarylane-controller'
-    ' && crane append -b ubuntu:24.04'
-    ' -f /tmp/bl-controller-image.tar -t $EXPECTED_REF',
+    'cargo build --release && tar cf /tmp/bl-controller-image.tar -C target/release binarylane-controller && crane append -b ubuntu:24.04 -f /tmp/bl-controller-image.tar -t $EXPECTED_REF',
     deps=["Cargo.toml", "Cargo.lock", "build.rs", "src/", "proto/", "binarylane-client/"],
     skips_local_docker=True,
 )
