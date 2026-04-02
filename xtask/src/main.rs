@@ -187,6 +187,7 @@ struct DevState {
     registry_host: Option<String>,
     registry_username: String,
     registry_password: Option<String>,
+    registry_htpasswd: Option<String>,
     registry_pull_secret_name: String,
     docker_config_dir: Option<String>,
     tilt_values_path: Option<String>,
@@ -441,14 +442,21 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         .registry_password
         .clone()
         .unwrap_or_else(generate_registry_password);
-    // Cost 4 (minimum) is fine for a dev-only registry credential.
-    let registry_password_bcrypt =
-        hash(&registry_password, 4).context("hashing registry password for basic auth")?;
-    let registry_htpasswd = format!("{}:{}\n", registry_username, registry_password_bcrypt);
+    // Reuse persisted htpasswd when password hasn't changed, since bcrypt salts differ each run.
+    let registry_htpasswd = match &state.registry_htpasswd {
+        Some(h) if state.registry_password.as_deref() == Some(&registry_password) => h.clone(),
+        _ => {
+            // Cost 4 (minimum) is fine for a dev-only registry credential.
+            let bcrypt =
+                hash(&registry_password, 4).context("hashing registry password for basic auth")?;
+            format!("{}:{}\n", registry_username, bcrypt)
+        }
+    };
 
     state.registry_host = Some(registry_host.clone());
     state.registry_username = registry_username.clone();
     state.registry_password = Some(registry_password.clone());
+    state.registry_htpasswd = Some(registry_htpasswd.clone());
     state.registry_pull_secret_name = args.registry_secret_name.clone();
     state.docker_config_dir = Some(path_to_string(&docker_config_dir)?);
     state.registry_image_repo = Some(format!("{}/binarylane-controller", registry_host));
@@ -859,9 +867,16 @@ else\n\
   SUDO=\"sudo\"\n\
 fi\n\
 ${{SUDO}} mkdir -p /etc/rancher/k3s\n\
-cat <<'EOF_REGISTRIES' | ${{SUDO}} tee /etc/rancher/k3s/registries.yaml >/dev/null\n\
+DESIRED_REGISTRIES=$(cat <<'EOF_REGISTRIES'\n\
 {registries_yaml}\
 EOF_REGISTRIES\n\
+)\n\
+registries_changed=0\n\
+CURRENT_REGISTRIES=$(${{SUDO}} cat /etc/rancher/k3s/registries.yaml 2>/dev/null || true)\n\
+if [ \"$DESIRED_REGISTRIES\" != \"$CURRENT_REGISTRIES\" ]; then\n\
+  printf '%s' \"$DESIRED_REGISTRIES\" | ${{SUDO}} tee /etc/rancher/k3s/registries.yaml >/dev/null\n\
+  registries_changed=1\n\
+fi\n\
 k3s_was_active=0\n\
 if ${{SUDO}} systemctl is-active --quiet k3s; then\n\
   k3s_was_active=1\n\
@@ -878,7 +893,7 @@ if ! command -v curl >/dev/null 2>&1; then\n\
 fi\n\
 if ! command -v k3s >/dev/null 2>&1; then\n\
   curl -sfL https://get.k3s.io | ${{SUDO}} env INSTALL_K3S_EXEC='server --write-kubeconfig-mode 644 --disable traefik --tls-san {host}' sh -s -\n\
-elif [ \"$k3s_was_active\" -eq 1 ]; then\n\
+elif [ \"$k3s_was_active\" -eq 1 ] && [ \"$registries_changed\" -eq 1 ]; then\n\
   ${{SUDO}} systemctl restart k3s\n\
 fi\n\
 ${{SUDO}} systemctl enable --now k3s >/dev/null 2>&1 || true\n\
