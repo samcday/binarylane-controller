@@ -93,6 +93,16 @@ pub struct CreateServerRequest {
     pub password: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ListedSize {
+    pub slug: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListedRegion {
+    pub slug: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoadBalancer {
     pub id: i64,
@@ -215,6 +225,26 @@ impl Client {
         Ok(Some(r.server))
     }
 
+    pub async fn get_server_by_hostname(&self, hostname: &str) -> Result<Option<Server>> {
+        let resp = self
+            .request(reqwest::Method::GET, "/servers")
+            .query(&[("hostname", hostname)])
+            .send()
+            .await
+            .context("getting server by hostname")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("getting server by hostname {hostname}: {status}: {body}");
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            servers: Vec<Server>,
+        }
+        let r: Resp = resp.json().await.context("decoding server")?;
+        Ok(r.servers.into_iter().next())
+    }
+
     pub async fn list_servers(&self) -> Result<Vec<Server>> {
         let mut all = Vec::new();
         let mut page = 1u32;
@@ -287,6 +317,86 @@ impl Client {
             }
             let r: Resp = resp.json().await.context("decoding images")?;
             all.extend(r.images);
+            if r.links.and_then(|l| l.pages.next).is_none() {
+                break;
+            }
+            page += 1;
+        }
+        Ok(all)
+    }
+
+    pub async fn list_sizes(&self) -> Result<Vec<ListedSize>> {
+        let mut all = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let resp = self
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/sizes?page={page}&per_page=100"),
+                )
+                .send()
+                .await
+                .context("listing sizes")?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("listing sizes: {status}: {body}");
+            }
+            #[derive(Deserialize)]
+            struct Pages {
+                next: Option<String>,
+            }
+            #[derive(Deserialize)]
+            struct Links {
+                pages: Pages,
+            }
+            #[derive(Deserialize)]
+            struct Resp {
+                sizes: Vec<ListedSize>,
+                links: Option<Links>,
+            }
+            let r: Resp = resp.json().await.context("decoding sizes")?;
+            all.extend(r.sizes);
+            if r.links.and_then(|l| l.pages.next).is_none() {
+                break;
+            }
+            page += 1;
+        }
+        Ok(all)
+    }
+
+    pub async fn list_regions(&self) -> Result<Vec<ListedRegion>> {
+        let mut all = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let resp = self
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/regions?page={page}&per_page=100"),
+                )
+                .send()
+                .await
+                .context("listing regions")?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("listing regions: {status}: {body}");
+            }
+            #[derive(Deserialize)]
+            struct Pages {
+                next: Option<String>,
+            }
+            #[derive(Deserialize)]
+            struct Links {
+                pages: Pages,
+            }
+            #[derive(Deserialize)]
+            struct Resp {
+                regions: Vec<ListedRegion>,
+                links: Option<Links>,
+            }
+            let r: Resp = resp.json().await.context("decoding regions")?;
+            all.extend(r.regions);
             if r.links.and_then(|l| l.pages.next).is_none() {
                 break;
             }

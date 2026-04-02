@@ -24,12 +24,10 @@ const DEFAULT_REGISTRY_USERNAME: &str = "dev";
 const DEFAULT_REGISTRY_SECRET_NAME: &str = "dev-registry-cred";
 const REGISTRY_NAMESPACE: &str = "binarylane-dev-registry";
 const REGISTRY_DATA_HOSTPATH: &str = "/var/lib/binarylane-dev-registry/registry-data";
-const REGISTRY_TLS_DATA_HOSTPATH: &str = "/var/lib/binarylane-dev-registry/caddy-data";
-const REGISTRY_TLS_CONFIG_HOSTPATH: &str = "/var/lib/binarylane-dev-registry/caddy-config";
 const DEV_AUTOSCALER_GROUP_ID: &str = "workers";
 
 const DEFAULT_REGION: &str = "syd";
-const DEFAULT_SIZE: &str = "std-1vcpu";
+const DEFAULT_SIZE: &str = "std-min";
 const DEFAULT_IMAGE: &str = "ubuntu-24.04";
 const DEFAULT_SSH_USER: &str = "root";
 const DEFAULT_MANAGED_SSH_KEY_PATH: &str = ".dev/dev-control-plane-ed25519";
@@ -53,6 +51,12 @@ enum Commands {
 
 #[derive(Debug, Args)]
 struct DevUpArgs {
+    /// Instance name for parallel dev environments (e.g. CI matrix jobs).
+    /// When set, all default paths move under `.dev/{instance}/` and resource
+    /// names are derived from the instance name instead of the local username.
+    #[arg(long, env = "BL_DEV_INSTANCE")]
+    instance: Option<String>,
+
     /// BinaryLane API token
     #[arg(long, env = "BL_API_TOKEN")]
     bl_api_token: String,
@@ -135,6 +139,12 @@ struct TiltArgs {
 
 #[derive(Debug, Args)]
 struct DevDownArgs {
+    /// Instance name for parallel dev environments (e.g. CI matrix jobs).
+    /// When set, all default paths move under `.dev/{instance}/` and resource
+    /// names are derived from the instance name instead of the local username.
+    #[arg(long, env = "BL_DEV_INSTANCE")]
+    instance: Option<String>,
+
     /// BinaryLane API token (required only if a tracked server must be deleted)
     #[arg(long, env = "BL_API_TOKEN")]
     bl_api_token: Option<String>,
@@ -177,6 +187,7 @@ struct DevState {
     registry_host: Option<String>,
     registry_username: String,
     registry_password: Option<String>,
+    registry_htpasswd: Option<String>,
     registry_pull_secret_name: String,
     docker_config_dir: Option<String>,
     tilt_values_path: Option<String>,
@@ -198,7 +209,6 @@ struct Server {
     id: i64,
     name: String,
     status: String,
-    permalink: Option<String>,
     networks: Networks,
 }
 
@@ -251,7 +261,102 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
+/// Replace a path field with an instance-scoped value when it still holds its
+/// compile-time default (i.e. the user did not explicitly override it).
+fn override_path_default(field: &mut PathBuf, default: &str, instance_path: &str) {
+    if *field == Path::new(default) {
+        *field = PathBuf::from(instance_path);
+    }
+}
+
+/// Apply instance-specific default overrides to the path fields shared by both
+/// `DevUpArgs` and `DevDownArgs`.
+fn apply_common_instance_paths(
+    inst: &str,
+    state_file: &mut PathBuf,
+    kubeconfig_out: &mut PathBuf,
+    known_hosts: &mut PathBuf,
+    docker_config_dir: &mut PathBuf,
+    tilt_values_out: &mut PathBuf,
+) {
+    override_path_default(
+        state_file,
+        DEFAULT_STATE_FILE,
+        &format!(".dev/{inst}/state.json"),
+    );
+    override_path_default(
+        kubeconfig_out,
+        DEFAULT_KUBECONFIG_OUT,
+        &format!(".dev/{inst}/kubeconfig"),
+    );
+    override_path_default(
+        known_hosts,
+        DEFAULT_KNOWN_HOSTS,
+        &format!(".dev/{inst}/known_hosts"),
+    );
+    override_path_default(
+        docker_config_dir,
+        DEFAULT_DOCKER_CONFIG_DIR,
+        &format!(".dev/{inst}/docker"),
+    );
+    override_path_default(
+        tilt_values_out,
+        DEFAULT_TILT_VALUES_OUT,
+        &format!(".dev/{inst}/tilt-values.yaml"),
+    );
+}
+
+/// Apply instance-specific default overrides to `DevUpArgs`.
+///
+/// For each field, we only overwrite it if the user did not explicitly pass a
+/// value (detected by comparing against the compile-time / computed default).
+fn apply_instance_overrides_up(args: &mut DevUpArgs) {
+    let inst = match &args.instance {
+        Some(i) => i.as_str(),
+        None => return,
+    };
+
+    apply_common_instance_paths(
+        inst,
+        &mut args.state_file,
+        &mut args.kubeconfig_out,
+        &mut args.known_hosts,
+        &mut args.docker_config_dir,
+        &mut args.tilt_values_out,
+    );
+    override_path_default(
+        &mut args.ssh_key_path,
+        DEFAULT_MANAGED_SSH_KEY_PATH,
+        &format!(".dev/{inst}/ssh-key"),
+    );
+    if args.server_name == default_server_name() {
+        args.server_name = format!("blc-{inst}");
+    }
+    if args.ssh_key_name == default_ssh_key_name() {
+        args.ssh_key_name = format!("blc-{inst}");
+    }
+}
+
+/// Apply instance-specific default overrides to `DevDownArgs`.
+fn apply_instance_overrides_down(args: &mut DevDownArgs) {
+    let inst = match &args.instance {
+        Some(i) => i.as_str(),
+        None => return,
+    };
+
+    apply_common_instance_paths(
+        inst,
+        &mut args.state_file,
+        &mut args.kubeconfig_out,
+        &mut args.known_hosts,
+        &mut args.docker_config_dir,
+        &mut args.tilt_values_out,
+    );
+}
+
+fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
+    let t_total = Instant::now();
+    apply_instance_overrides_up(&mut args);
     ensure_tool("ssh", "install OpenSSH client")?;
     ensure_tool("ssh-keygen", "install OpenSSH tools")?;
 
@@ -316,16 +421,16 @@ fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
     state.tilt_values_path = Some(path_to_string(&tilt_values_out)?);
     save_state(&args.state_file, &state)?;
 
+    let t = Instant::now();
     server = wait_for_server_active(&client, server.id, timeout)?;
+    eprintln!(
+        "  server active ........... {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
     let server_ip = server
         .public_ipv4()
         .ok_or_else(|| anyhow::anyhow!("server {} has no public IPv4", server.id))?;
-    let registry_host = server.registry_host().ok_or_else(|| {
-        anyhow::anyhow!(
-            "server {} has no permalink hostname for public dev registry",
-            server.id
-        )
-    })?;
+    let registry_host = format!("{}:30500", server_ip);
 
     // Keep the previously persisted username when present so repeated runs remain idempotent.
     let registry_username = if state.registry_username.trim().is_empty() {
@@ -337,13 +442,21 @@ fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
         .registry_password
         .clone()
         .unwrap_or_else(generate_registry_password);
-    // Cost 4 (minimum) is fine for a dev-only registry credential.
-    let registry_password_bcrypt =
-        hash(&registry_password, 4).context("hashing registry password for basic auth")?;
+    // Reuse persisted htpasswd when password hasn't changed, since bcrypt salts differ each run.
+    let registry_htpasswd = match &state.registry_htpasswd {
+        Some(h) if state.registry_password.as_deref() == Some(&registry_password) => h.clone(),
+        _ => {
+            // Cost 4 (minimum) is fine for a dev-only registry credential.
+            let bcrypt =
+                hash(&registry_password, 4).context("hashing registry password for basic auth")?;
+            format!("{}:{}\n", registry_username, bcrypt)
+        }
+    };
 
     state.registry_host = Some(registry_host.clone());
     state.registry_username = registry_username.clone();
     state.registry_password = Some(registry_password.clone());
+    state.registry_htpasswd = Some(registry_htpasswd.clone());
     state.registry_pull_secret_name = args.registry_secret_name.clone();
     state.docker_config_dir = Some(path_to_string(&docker_config_dir)?);
     state.registry_image_repo = Some(format!("{}/binarylane-controller", registry_host));
@@ -356,6 +469,7 @@ fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
         }
     }
 
+    let t = Instant::now();
     let ssh_user = wait_for_ssh_ready(
         &server_ip,
         &ssh_users,
@@ -363,23 +477,40 @@ fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
         &args.known_hosts,
         timeout,
     )?;
+    eprintln!(
+        "  ssh ready ............... {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
 
+    let k3s_registry = K3sRegistryConfig {
+        host: &registry_host,
+        username: &registry_username,
+        password: &registry_password,
+    };
+
+    let t = Instant::now();
     ensure_k3s_server(
         &server_ip,
         &ssh_user,
         Some(&ssh_key_path),
         &args.known_hosts,
+        &k3s_registry,
         timeout,
     )?;
+    eprintln!(
+        "  k3s ready ............... {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
 
     let registry_config = RegistryConfig {
         host: &registry_host,
         username: &registry_username,
         password: &registry_password,
-        password_bcrypt: &registry_password_bcrypt,
+        htpasswd: &registry_htpasswd,
         secret_name: &args.registry_secret_name,
     };
 
+    let t = Instant::now();
     ensure_dev_registry(
         &server_ip,
         &ssh_user,
@@ -388,12 +519,22 @@ fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
         &registry_config,
         timeout,
     )?;
-    wait_for_registry_https(
+    eprintln!(
+        "  registry deployed ....... {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
+
+    let t = Instant::now();
+    wait_for_registry(
         &registry_host,
         &registry_username,
         &registry_password,
         timeout,
     )?;
+    eprintln!(
+        "  registry http ready ..... {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
 
     let raw_kubeconfig = read_remote_file(
         &server_ip,
@@ -497,10 +638,15 @@ fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
     emit_env("TMPL_K3S_URL", &k3s_url);
     emit_env("TMPL_K3S_TOKEN", &k3s_token);
 
+    eprintln!(
+        "  total ................... {:.1}s",
+        t_total.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
-fn cmd_dev_down(args: DevDownArgs) -> Result<()> {
+fn cmd_dev_down(mut args: DevDownArgs) -> Result<()> {
+    apply_instance_overrides_down(&mut args);
     let state = load_state(&args.state_file)?;
 
     let needs_api = state.server_id.is_some() || state.ssh_key_id.is_some();
@@ -628,7 +774,12 @@ fn wait_for_server_active(client: &BlClient, server_id: i64, timeout: Duration) 
             .ok_or_else(|| anyhow::anyhow!("server id={} disappeared while waiting", server_id))?;
 
         if server.status != last_status {
-            eprintln!("Server id={} status={}", server_id, server.status);
+            eprintln!(
+                "Server id={} status={} ({:.0}s)",
+                server_id,
+                server.status,
+                start.elapsed().as_secs_f64()
+            );
             last_status = server.status.clone();
         }
 
@@ -693,11 +844,18 @@ fn ensure_k3s_server(
     user: &str,
     ssh_key_path: Option<&Path>,
     known_hosts: &Path,
+    registry: &K3sRegistryConfig<'_>,
     timeout: Duration,
 ) -> Result<()> {
     eprintln!("Installing/verifying k3s control plane on {}...", host);
     let start = Instant::now();
     let k3s_url = format!("https://{}:6443", host);
+    let registries_yaml = format!(
+        "mirrors:\n  \"{registry_host}\":\n    endpoint:\n      - \"http://{registry_host}\"\nconfigs:\n  \"{registry_host}\":\n    auth:\n      username: {registry_username}\n      password: {registry_password}\n",
+        registry_host = registry.host,
+        registry_username = yaml_escape(registry.username),
+        registry_password = yaml_escape(registry.password),
+    );
     let install_script = format!(
         "set -eu\n\
 if command -v cloud-init >/dev/null 2>&1; then\n\
@@ -707,6 +865,21 @@ if [ \"$(id -u)\" -eq 0 ]; then\n\
   SUDO=\"\"\n\
 else\n\
   SUDO=\"sudo\"\n\
+fi\n\
+${{SUDO}} mkdir -p /etc/rancher/k3s\n\
+DESIRED_REGISTRIES=$(cat <<'EOF_REGISTRIES'\n\
+{registries_yaml}\
+EOF_REGISTRIES\n\
+)\n\
+registries_changed=0\n\
+CURRENT_REGISTRIES=$(${{SUDO}} cat /etc/rancher/k3s/registries.yaml 2>/dev/null || true)\n\
+if [ \"$DESIRED_REGISTRIES\" != \"$CURRENT_REGISTRIES\" ]; then\n\
+  printf '%s' \"$DESIRED_REGISTRIES\" | ${{SUDO}} tee /etc/rancher/k3s/registries.yaml >/dev/null\n\
+  registries_changed=1\n\
+fi\n\
+k3s_was_active=0\n\
+if ${{SUDO}} systemctl is-active --quiet k3s; then\n\
+  k3s_was_active=1\n\
 fi\n\
 if ! command -v curl >/dev/null 2>&1; then\n\
   if command -v apt-get >/dev/null 2>&1; then\n\
@@ -720,9 +893,12 @@ if ! command -v curl >/dev/null 2>&1; then\n\
 fi\n\
 if ! command -v k3s >/dev/null 2>&1; then\n\
   curl -sfL https://get.k3s.io | ${{SUDO}} env INSTALL_K3S_EXEC='server --write-kubeconfig-mode 644 --disable traefik --tls-san {host}' sh -s -\n\
+elif [ \"$k3s_was_active\" -eq 1 ] && [ \"$registries_changed\" -eq 1 ]; then\n\
+  ${{SUDO}} systemctl restart k3s\n\
 fi\n\
 ${{SUDO}} systemctl enable --now k3s >/dev/null 2>&1 || true\n\
-${{SUDO}} systemctl is-active --quiet k3s\n"
+${{SUDO}} systemctl is-active --quiet k3s\n",
+        registries_yaml = registries_yaml,
     );
 
     loop {
@@ -753,8 +929,14 @@ struct RegistryConfig<'a> {
     host: &'a str,
     username: &'a str,
     password: &'a str,
-    password_bcrypt: &'a str,
+    htpasswd: &'a str,
     secret_name: &'a str,
+}
+
+struct K3sRegistryConfig<'a> {
+    host: &'a str,
+    username: &'a str,
+    password: &'a str,
 }
 
 fn ensure_dev_registry(
@@ -766,7 +948,7 @@ fn ensure_dev_registry(
     timeout: Duration,
 ) -> Result<()> {
     eprintln!(
-        "Deploying authenticated dev registry at https://{}...",
+        "Deploying authenticated dev registry at http://{}...",
         registry.host
     );
 
@@ -795,12 +977,22 @@ spec:
         - name: registry
           image: registry:2
           imagePullPolicy: IfNotPresent
+          env:
+            - name: REGISTRY_AUTH
+              value: htpasswd
+            - name: REGISTRY_AUTH_HTPASSWD_REALM
+              value: dev
+            - name: REGISTRY_AUTH_HTPASSWD_PATH
+              value: /auth/htpasswd
           ports:
             - containerPort: 5000
               name: http
           volumeMounts:
             - name: data
               mountPath: /var/lib/registry
+            - name: auth
+              mountPath: /auth/htpasswd
+              subPath: htpasswd
           securityContext:
             runAsUser: 0
             runAsGroup: 0
@@ -809,6 +1001,19 @@ spec:
           hostPath:
             path: {registry_data_hostpath}
             type: DirectoryOrCreate
+        - name: auth
+          secret:
+            secretName: registry-auth
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: registry-auth
+  namespace: {ns}
+type: Opaque
+stringData:
+  htpasswd: |
+{registry_htpasswd}
 ---
 apiVersion: v1
 kind: Service
@@ -816,84 +1021,18 @@ metadata:
   name: registry
   namespace: {ns}
 spec:
+  type: NodePort
   selector:
     app: registry
   ports:
     - name: http
       port: 5000
       targetPort: 5000
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: registry-gateway-caddyfile
-  namespace: {ns}
-data:
-  Caddyfile: |
-    https://{registry_host} {{
-      basic_auth {{
-        {registry_username} {registry_password_bcrypt}
-      }}
-      reverse_proxy registry.{ns}.svc.cluster.local:5000
-    }}
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: registry-gateway
-  namespace: {ns}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: registry-gateway
-  template:
-    metadata:
-      labels:
-        app: registry-gateway
-    spec:
-      hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
-      containers:
-        - name: caddy
-          image: caddy:2.9-alpine
-          imagePullPolicy: IfNotPresent
-          ports:
-            - containerPort: 80
-              name: http
-            - containerPort: 443
-              name: https
-          volumeMounts:
-            - name: caddyfile
-              mountPath: /etc/caddy/Caddyfile
-              subPath: Caddyfile
-            - name: caddy-data
-              mountPath: /data
-            - name: caddy-config
-              mountPath: /config
-          securityContext:
-            runAsUser: 0
-            runAsGroup: 0
-      volumes:
-        - name: caddyfile
-          configMap:
-            name: registry-gateway-caddyfile
-        - name: caddy-data
-          hostPath:
-            path: {registry_tls_data_hostpath}
-            type: DirectoryOrCreate
-        - name: caddy-config
-          hostPath:
-            path: {registry_tls_config_hostpath}
-            type: DirectoryOrCreate
+      nodePort: 30500
 "#,
         ns = REGISTRY_NAMESPACE,
         registry_data_hostpath = REGISTRY_DATA_HOSTPATH,
-        registry_tls_data_hostpath = REGISTRY_TLS_DATA_HOSTPATH,
-        registry_tls_config_hostpath = REGISTRY_TLS_CONFIG_HOSTPATH,
-        registry_host = registry.host,
-        registry_username = registry.username,
-        registry_password_bcrypt = registry.password_bcrypt,
+        registry_htpasswd = indent_block(registry.htpasswd, 4),
     );
 
     let default_sa_patch = format!(
@@ -923,7 +1062,6 @@ for ns in default; do
   ${{SUDO}} kubectl -n "$ns" patch serviceaccount default --type='merge' -p={default_sa_patch} >/dev/null
 done
 ${{SUDO}} kubectl -n {registry_ns} rollout status deployment/registry --timeout=300s
-${{SUDO}} kubectl -n {registry_ns} rollout status deployment/registry-gateway --timeout=300s
 "#,
         manifest = manifest,
         registry_ns = REGISTRY_NAMESPACE,
@@ -959,14 +1097,14 @@ ${{SUDO}} kubectl -n {registry_ns} rollout status deployment/registry-gateway --
     }
 }
 
-fn wait_for_registry_https(
+fn wait_for_registry(
     registry_host: &str,
     registry_username: &str,
     registry_password: &str,
     timeout: Duration,
 ) -> Result<()> {
     eprintln!(
-        "Waiting for registry endpoint https://{}/v2/ ...",
+        "Waiting for registry endpoint http://{}/v2/ ...",
         registry_host
     );
 
@@ -978,21 +1116,37 @@ fn wait_for_registry_https(
     let start = Instant::now();
     loop {
         let resp = client
-            .get(format!("https://{registry_host}/v2/"))
+            .get(format!("http://{registry_host}/v2/"))
             .basic_auth(registry_username, Some(registry_password))
             .send();
 
-        if let Ok(resp) = resp {
-            if resp.status().is_success() {
-                eprintln!("Registry endpoint is reachable");
+        match resp {
+            Ok(resp) if resp.status().is_success() => {
+                eprintln!(
+                    "Registry endpoint is reachable ({:.0}s)",
+                    start.elapsed().as_secs_f64()
+                );
                 return Ok(());
             }
-            eprintln!("Registry probe returned status {}", resp.status());
+            Ok(resp) => {
+                eprintln!(
+                    "Registry probe: status {} ({:.0}s)",
+                    resp.status(),
+                    start.elapsed().as_secs_f64()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "Registry probe: {} ({:.0}s)",
+                    e,
+                    start.elapsed().as_secs_f64()
+                );
+            }
         }
 
         if start.elapsed() > timeout {
             bail!(
-                "timed out waiting for registry endpoint https://{}/v2/",
+                "timed out waiting for registry endpoint http://{}/v2/",
                 registry_host
             );
         }
@@ -1441,6 +1595,17 @@ fn yaml_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+fn indent_block(value: &str, spaces: usize) -> String {
+    let prefix = " ".repeat(spaces);
+    let mut out = String::new();
+    for line in value.lines() {
+        out.push_str(&prefix);
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 fn generate_registry_password() -> String {
     thread_rng()
         .sample_iter(Alphanumeric)
@@ -1509,14 +1674,6 @@ impl Server {
             .iter()
             .find(|n| n.net_type == "public")
             .map(|n| n.ip_address.clone())
-    }
-
-    fn registry_host(&self) -> Option<String> {
-        self.permalink
-            .as_ref()
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty())
-            .map(ToString::to_string)
     }
 }
 

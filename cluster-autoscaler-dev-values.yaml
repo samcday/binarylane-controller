@@ -15,7 +15,7 @@ extraArgs:
   scan-interval: "10s"
   scale-down-delay-after-add: "2m"
   scale-down-unneeded-time: "2m"
-  v: "5"
+  v: "1"
 
 extraVolumes:
   - name: cloud-config

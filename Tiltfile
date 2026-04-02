@@ -24,11 +24,13 @@ if registry_image == "ghcr.io/samcday/binarylane-controller":
 
 # No live_update: the distroless runtime image has no tar/rm, which Tilt
 # needs for file sync. Full rebuild via the dep-cached Dockerfile is ~30s.
-docker_build(
+custom_build(
     registry_image,
-    ".",
-    dockerfile="Dockerfile",
-    only=["Cargo.toml", "Cargo.lock", "build.rs", "src/", "proto/", "binarylane-client/"],
+    'docker build -t $EXPECTED_REF . -f Dockerfile && ' +
+    '_img=$(mktemp) && docker save -o "$_img" "$EXPECTED_REF" && ' +
+    'crane push --insecure "$_img" "$EXPECTED_REF" && rm -f "$_img"',
+    deps=["Cargo.toml", "Cargo.lock", "build.rs", "src/", "proto/", "binarylane-client/"],
+    skips_local_docker=True,
 )
 
 # Generate stable mTLS certs for dev. These persist in .dev/ and are only

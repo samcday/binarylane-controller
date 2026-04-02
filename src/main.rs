@@ -1,8 +1,7 @@
 mod autoscaler;
 use binarylane_client as binarylane;
+mod controllers;
 mod dns_webhook;
-mod node_controller;
-mod service_controller;
 
 pub mod proto {
     tonic::include_proto!("clusterautoscaler.cloudprovider.v1.externalgrpc");
@@ -47,6 +46,14 @@ struct Args {
     #[arg(long, env = "EXTERNAL_DNS_LISTEN_ADDR")]
     external_dns_listen_addr: Option<String>,
 
+    /// Enable external-dns webhook server
+    #[arg(long, env = "EXTERNAL_DNS_WEBHOOK", default_value_t = false)]
+    external_dns_webhook: bool,
+
+    /// Enable cluster-autoscaler gRPC service
+    #[arg(long, env = "CLUSTER_AUTOSCALER_SERVICE", default_value_t = false)]
+    cluster_autoscaler_service: bool,
+
     /// Namespace the controller runs in (for namespaced Secret reconciliation)
     #[arg(long, env = "POD_NAMESPACE", default_value = "binarylane-system")]
     pod_namespace: String,
@@ -62,6 +69,11 @@ struct Args {
     /// TLS CA certificate path
     #[arg(long, env = "TLS_CA_PATH")]
     tls_ca_path: Option<String>,
+
+    /// Comma-separated list of controllers to run.
+    /// Use '*' for all defaults, '-name' to exclude.
+    #[arg(long, env = "CONTROLLERS", default_value = "*")]
+    controllers: String,
 }
 
 #[tokio::main]
@@ -74,54 +86,91 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let enabled = controllers::resolve_controllers(&args.controllers);
     let bl = binarylane::Client::new(args.bl_api_token);
     let k8s = kube::Client::try_default()
         .await
         .context("building kubernetes client")?;
 
-    // Start node controller
-    let bl_nc = bl.clone();
-    let k8s_nc = k8s.clone();
-    let pod_namespace_nc = args.pod_namespace.clone();
-    let node_handle = tokio::spawn(async move {
-        info!(interval = ?Duration::from_secs(30), "node controller starting");
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            node_controller::reconcile(&bl_nc, &k8s_nc, &pod_namespace_nc).await;
-        }
+    let ctx = std::sync::Arc::new(controllers::ReconcileContext {
+        bl: bl.clone(),
+        k8s: k8s.clone(),
+        secret_namespace: args.pod_namespace.clone(),
     });
 
-    // Start service controller
-    let bl_sc = bl.clone();
-    let k8s_sc = k8s.clone();
-    let svc_handle = tokio::spawn(async move {
-        info!(interval = ?Duration::from_secs(30), "service controller starting");
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            service_controller::reconcile(&bl_sc, &k8s_sc).await;
-        }
-    });
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    // Monitor controller tasks - exit if either dies
-    tokio::spawn(async move {
-        tokio::select! {
-            result = node_handle => {
-                match result {
-                    Ok(_) => error!("node controller exited unexpectedly"),
-                    Err(e) => error!(error = %e, "node controller panicked"),
-                }
+    if enabled.contains("node-sync") {
+        let ctx = ctx.clone();
+        handles.push(tokio::spawn(async move {
+            info!(interval = ?Duration::from_secs(30), "node-sync controller starting");
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                controllers::node_sync::reconcile(&ctx).await;
             }
-            result = svc_handle => {
-                match result {
-                    Ok(_) => error!("service controller exited unexpectedly"),
-                    Err(e) => error!(error = %e, "service controller panicked"),
-                }
+        }));
+    }
+
+    if enabled.contains("node-deletion") {
+        let ctx = ctx.clone();
+        handles.push(tokio::spawn(async move {
+            info!(interval = ?Duration::from_secs(30), "node-deletion controller starting");
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                controllers::node_deletion::reconcile(&ctx).await;
             }
-        }
-        std::process::exit(1);
-    });
+        }));
+    }
+
+    if enabled.contains("node-bind") {
+        let ctx = ctx.clone();
+        handles.push(tokio::spawn(async move {
+            info!(interval = ?Duration::from_secs(30), "node-bind controller starting");
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                controllers::node_bind::reconcile(&ctx).await;
+            }
+        }));
+    }
+
+    if enabled.contains("node-provision") {
+        let ctx = ctx.clone();
+        handles.push(tokio::spawn(async move {
+            info!(interval = ?Duration::from_secs(30), "node-provision controller starting");
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                controllers::node_provision::reconcile(&ctx).await;
+            }
+        }));
+    }
+
+    if enabled.contains("service") {
+        let ctx = ctx.clone();
+        handles.push(tokio::spawn(async move {
+            info!(interval = ?Duration::from_secs(30), "service controller starting");
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                controllers::service::reconcile(&ctx).await;
+            }
+        }));
+    }
+
+    // Monitor controller tasks - exit if any die
+    if !handles.is_empty() {
+        tokio::spawn(async move {
+            let (result, _index, _remaining) = futures::future::select_all(handles).await;
+            match result {
+                Ok(_) => error!("controller exited unexpectedly"),
+                Err(e) => error!(error = %e, "controller panicked"),
+            }
+            std::process::exit(1);
+        });
+    }
 
     let tls_vars = [&args.tls_cert_path, &args.tls_key_path, &args.tls_ca_path];
     let tls_set = tls_vars.iter().filter(|v| v.is_some()).count();
@@ -151,7 +200,9 @@ async fn main() -> Result<()> {
         None
     };
 
-    if let Some(listen_addr) = args.external_dns_listen_addr.clone() {
+    if let Some(listen_addr) = args.external_dns_listen_addr.clone()
+        && args.external_dns_webhook
+    {
         let addr = listen_addr
             .parse()
             .context("parsing external-dns listen address")?;
@@ -167,6 +218,11 @@ async fn main() -> Result<()> {
     }
 
     // Load autoscaler config
+    if !args.cluster_autoscaler_service {
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
+
     let cfg_data = match tokio::fs::read_to_string(&args.config_path).await {
         Ok(data) => data,
         Err(e) => {
@@ -188,8 +244,7 @@ async fn main() -> Result<()> {
         .filter_map(|(k, v)| k.strip_prefix("TMPL_").map(|k| (k.to_string(), v)))
         .collect::<HashMap<_, _>>();
 
-    let provider =
-        autoscaler::Provider::new(bl, k8s.clone(), cfg.clone(), args.pod_namespace.clone());
+    let provider = autoscaler::Provider::new(k8s.clone(), cfg.clone(), args.pod_namespace.clone());
     let svc = proto::cloud_provider_server::CloudProviderServer::new(provider);
 
     info!(

@@ -39,8 +39,7 @@ metadata:
   name: scale-test
   namespace: default
 spec:
-  type: LoadBalancer
-  loadBalancerClass: binarylane.com.au/load-balancer
+  type: ClusterIP
   selector:
     app: scale-test
   ports:

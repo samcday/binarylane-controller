@@ -42,6 +42,16 @@ spec:
                 secretKeyRef:
                   name: {{ include "binarylane-controller.secretName" . }}
                   key: {{ .Values.existingSecretKey }}
+            - name: CONTROLLERS
+              value: {{ .Values.controllers | quote }}
+            {{- if .Values.autoscaler.enabled }}
+            - name: CLUSTER_AUTOSCALER_SERVICE
+              value: "true"
+            {{- end }}
+            {{- if .Values.externalDns.enabled }}
+            - name: EXTERNAL_DNS_WEBHOOK
+              value: "true"
+            {{- end }}
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
