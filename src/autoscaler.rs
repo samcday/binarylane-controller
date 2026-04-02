@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 
 use k8s_openapi::api::core::v1::{
     Node as K8sNode, NodeSpec as K8sNodeSpec, Secret as K8sSecret, Taint as K8sTaint,
@@ -12,11 +11,10 @@ use kube::Api;
 use kube::api::{Patch, PatchParams};
 use prost_014::Message;
 use serde::Deserialize;
-use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
-use crate::binarylane::{self, Client as BlClient};
+use crate::binarylane;
 use crate::controllers;
 use crate::proto;
 
@@ -49,21 +47,17 @@ pub struct Config {
 }
 
 pub struct Provider {
-    bl: BlClient,
     k8s: kube::Client,
     cfg: Config,
     secret_namespace: String,
-    servers: Arc<RwLock<HashMap<i64, binarylane::Server>>>,
 }
 
 impl Provider {
-    pub fn new(bl: BlClient, k8s: kube::Client, cfg: Config, secret_namespace: String) -> Self {
+    pub fn new(k8s: kube::Client, cfg: Config, secret_namespace: String) -> Self {
         Self {
-            bl,
             k8s,
             cfg,
             secret_namespace,
-            servers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -71,14 +65,22 @@ impl Provider {
         self.cfg.node_groups.iter().find(|ng| ng.id == id)
     }
 
-    async fn servers_for_group(&self, group_id: &str) -> Vec<binarylane::Server> {
+    /// Lists K8s nodes belonging to a node group, excluding those being deleted.
+    async fn nodes_for_group(&self, group_id: &str) -> Result<Vec<K8sNode>, Status> {
         let prefix = format!("{}{group_id}-", self.cfg.name_prefix);
-        let servers = self.servers.read().await;
-        servers
-            .values()
-            .filter(|s| s.name.starts_with(&prefix))
-            .cloned()
-            .collect()
+        let nodes_api: Api<K8sNode> = Api::all(self.k8s.clone());
+        let node_list = nodes_api
+            .list(&Default::default())
+            .await
+            .map_err(|e| Status::internal(format!("listing nodes: {e}")))?;
+        Ok(node_list
+            .items
+            .into_iter()
+            .filter(|n| {
+                let name = n.metadata.name.as_deref().unwrap_or("");
+                name.starts_with(&prefix) && n.metadata.deletion_timestamp.is_none()
+            })
+            .collect())
     }
 
     fn render_cloud_init(&self, vars: &HashMap<String, String>) -> String {
@@ -185,26 +187,9 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
                 }));
             }
         };
-        let server_id = match binarylane::parse_provider_id(&node.provider_id) {
-            Some(id) => id,
-            None => {
-                return Ok(Response::new(proto::NodeGroupForNodeResponse {
-                    node_group: None,
-                }));
-            }
-        };
-        let servers = self.servers.read().await;
-        let srv = match servers.get(&server_id) {
-            Some(s) => s,
-            None => {
-                return Ok(Response::new(proto::NodeGroupForNodeResponse {
-                    node_group: None,
-                }));
-            }
-        };
         for ng in &self.cfg.node_groups {
             let prefix = format!("{}{}-", self.cfg.name_prefix, ng.id);
-            if srv.name.starts_with(&prefix) {
+            if node.name.starts_with(&prefix) {
                 return Ok(Response::new(proto::NodeGroupForNodeResponse {
                     node_group: Some(proto::NodeGroup {
                         id: ng.id.clone(),
@@ -224,19 +209,6 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
         &self,
         _req: Request<proto::RefreshRequest>,
     ) -> Result<Response<proto::RefreshResponse>, Status> {
-        let all_servers = self
-            .bl
-            .list_servers()
-            .await
-            .map_err(|e| Status::internal(format!("refreshing servers: {e}")))?;
-        let mut servers = self.servers.write().await;
-        servers.clear();
-        for s in all_servers {
-            if s.name.starts_with(&self.cfg.name_prefix) {
-                servers.insert(s.id, s);
-            }
-        }
-        info!(managed_count = servers.len(), "refreshed server list");
         Ok(Response::new(proto::RefreshResponse {}))
     }
 
@@ -287,7 +259,7 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
         if self.find_group(id).is_none() {
             return Err(Status::not_found(format!("node group {id} not found")));
         }
-        let count = self.servers_for_group(id).await.len() as i32;
+        let count = self.nodes_for_group(id).await?.len() as i32;
         Ok(Response::new(proto::NodeGroupTargetSizeResponse {
             target_size: count,
         }))
@@ -308,7 +280,7 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
             .find_group(&req.id)
             .ok_or_else(|| Status::not_found(format!("node group {} not found", req.id)))?
             .clone();
-        let current = self.servers_for_group(&req.id).await;
+        let current = self.nodes_for_group(&req.id).await?;
         if req.delta as usize + current.len() > ng.max_size as usize {
             return Err(Status::invalid_argument(format!(
                 "increase would exceed max size {}",
@@ -389,16 +361,13 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
                 req.id
             )));
         }
+        let nodes_api: Api<K8sNode> = Api::all(self.k8s.clone());
         for node in &req.nodes {
-            let server_id = binarylane::parse_provider_id(&node.provider_id).ok_or_else(|| {
-                Status::invalid_argument(format!("invalid provider ID: {}", node.provider_id))
-            })?;
-            info!(id = server_id, "deleting server");
-            self.bl
-                .delete_server(server_id)
+            info!(name = %node.name, "deleting node");
+            nodes_api
+                .delete(&node.name, &Default::default())
                 .await
-                .map_err(|e| Status::internal(format!("deleting server: {e}")))?;
-            self.servers.write().await.remove(&server_id);
+                .map_err(|e| Status::internal(format!("deleting node {}: {e}", node.name)))?;
         }
         Ok(Response::new(proto::NodeGroupDeleteNodesResponse {}))
     }
@@ -425,22 +394,19 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
         if self.find_group(id).is_none() {
             return Err(Status::not_found(format!("node group {id} not found")));
         }
-        let servers = self.servers_for_group(id).await;
-        let instances = servers
+        let nodes = self.nodes_for_group(id).await?;
+        let instances = nodes
             .iter()
-            .map(|s| {
-                let state = match s.status.as_str() {
-                    "active" => proto::instance_status::InstanceState::InstanceRunning as i32,
-                    "new" => proto::instance_status::InstanceState::InstanceCreating as i32,
-                    _ => proto::instance_status::InstanceState::Unspecified as i32,
-                };
-                proto::Instance {
-                    id: binarylane::server_provider_id(s.id),
+            .filter_map(|n| {
+                let provider_id = n.spec.as_ref()?.provider_id.as_ref()?;
+                Some(proto::Instance {
+                    id: provider_id.clone(),
                     status: Some(proto::InstanceStatus {
-                        instance_state: state,
+                        instance_state: proto::instance_status::InstanceState::InstanceRunning
+                            as i32,
                         error_info: None,
                     }),
-                }
+                })
             })
             .collect();
         Ok(Response::new(proto::NodeGroupNodesResponse { instances }))

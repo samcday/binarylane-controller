@@ -244,8 +244,7 @@ async fn main() -> Result<()> {
         .filter_map(|(k, v)| k.strip_prefix("TMPL_").map(|k| (k.to_string(), v)))
         .collect::<HashMap<_, _>>();
 
-    let provider =
-        autoscaler::Provider::new(bl, k8s.clone(), cfg.clone(), args.pod_namespace.clone());
+    let provider = autoscaler::Provider::new(k8s.clone(), cfg.clone(), args.pod_namespace.clone());
     let svc = proto::cloud_provider_server::CloudProviderServer::new(provider);
 
     info!(
