@@ -225,17 +225,12 @@ pub async fn reconcile(ctx: &ReconcileContext) {
                 clear_provision_failed(&nodes_api, name).await;
             }
             Err(e) => {
+                // Don't set the failed-config annotation — transient errors
+                // (API timeouts, rate limits) should be retried on next cycle.
                 let msg = format!("server creation failed: {e:#}");
-                set_provision_failed(
-                    &nodes_api,
-                    &ctx.k8s,
-                    name,
-                    node_uid,
-                    &hash,
-                    "ProvisionError",
-                    &msg,
-                )
-                .await;
+                error!(error = %e, node = name, "node-provision: provisioning failed");
+                emit_event(&ctx.k8s, name, node_uid, "Warning", "ProvisionError", &msg)
+                    .await;
             }
         }
     }
