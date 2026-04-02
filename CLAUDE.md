@@ -4,15 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-A Kubernetes cloud provider controller for BinaryLane (Australian VPS provider). Individually-toggleable reconcilers managed via `--controllers` flag (kube-controller-manager style):
+A Kubernetes cloud provider controller for BinaryLane (Australian VPS provider). Individually-toggleable reconcilers managed via `--controllers` flag (kube-controller-manager style), plus optional servers enabled via separate flags:
 
 1. **node-sync** - syncs K8s node addresses/labels/taints from BinaryLane server metadata
 2. **node-deletion** - handles node/server cleanup (deletion, orphan removal, finalizer management)
 3. **node-bind** - matches unbound K8s nodes to BinaryLane servers by hostname (opt-in via `bl.samcday.com/adopt` annotation)
 4. **node-provision** - provisions BinaryLane servers for Nodes with provision labels (`bl.samcday.com/size`, `region`, `image`)
 5. **service** - manages LoadBalancer-type services via BinaryLane load balancers
-6. **autoscaler** - gRPC CloudProvider for cluster-autoscaler (creates Node + Secrets, node-provision does the rest)
-7. **dns-webhook** - external-dns webhook provider
+6. **autoscaler** - gRPC CloudProvider for cluster-autoscaler (enabled via `--cluster-autoscaler-service`)
+7. **dns-webhook** - external-dns webhook provider (enabled via `--external-dns-webhook`)
 
 ## Build & Run
 

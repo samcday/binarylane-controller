@@ -53,7 +53,7 @@ const DEFAULT_CONTROLLERS: &[&str] = &[
 /// Examples:
 /// - `"*"` → all defaults
 /// - `"*,-service"` → all defaults except service
-/// - `"*,autoscaler"` → all defaults plus autoscaler
+/// - `"*,-node-provision"` → all defaults except node-provision
 /// - `"node-sync,node-bind"` → only those two
 pub fn resolve_controllers(spec: &str) -> HashSet<String> {
     let mut result = HashSet::new();

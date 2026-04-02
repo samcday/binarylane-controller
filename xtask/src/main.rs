@@ -853,8 +853,8 @@ fn ensure_k3s_server(
     let registries_yaml = format!(
         "mirrors:\n  \"{registry_host}\":\n    endpoint:\n      - \"http://{registry_host}\"\nconfigs:\n  \"{registry_host}\":\n    auth:\n      username: {registry_username}\n      password: {registry_password}\n",
         registry_host = registry.host,
-        registry_username = registry.username,
-        registry_password = registry.password,
+        registry_username = yaml_escape(registry.username),
+        registry_password = yaml_escape(registry.password),
     );
     let install_script = format!(
         "set -eu\n\

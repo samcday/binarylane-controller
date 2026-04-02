@@ -38,6 +38,28 @@ pub async fn reconcile(ctx: &ReconcileContext) {
         }
     };
 
+    let sizes = match ctx.bl.list_sizes().await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "node-provision: listing sizes");
+            return;
+        }
+    };
+    let regions = match ctx.bl.list_regions().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "node-provision: listing regions");
+            return;
+        }
+    };
+    let images = match ctx.bl.list_images().await {
+        Ok(i) => i,
+        Err(e) => {
+            error!(error = %e, "node-provision: listing images");
+            return;
+        }
+    };
+
     for node in &nodes {
         let Some(name) = node.metadata.name.as_deref() else {
             continue;
@@ -111,103 +133,79 @@ pub async fn reconcile(ctx: &ReconcileContext) {
         let region = region.unwrap();
         let image = image.unwrap();
 
-        // Validate size slug against BinaryLane API.
-        match ctx.bl.list_sizes().await {
-            Ok(sizes) => {
-                if !sizes.iter().any(|s| s.slug == *size) {
-                    let msg = format!(
-                        "unknown size '{}' (available: {})",
-                        size,
-                        sizes
-                            .iter()
-                            .map(|s| s.slug.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                    set_provision_failed(
-                        &nodes_api,
-                        &ctx.k8s,
-                        name,
-                        node_uid,
-                        &hash,
-                        "InvalidConfig",
-                        &msg,
-                    )
-                    .await;
-                    continue;
-                }
-            }
-            Err(e) => {
-                error!(error = %e, node = name, "node-provision: listing sizes for validation");
-                continue;
-            }
-        }
-
-        // Validate region slug against BinaryLane API.
-        match ctx.bl.list_regions().await {
-            Ok(regions) => {
-                if !regions.iter().any(|r| r.slug == *region) {
-                    let msg = format!(
-                        "unknown region '{}' (available: {})",
-                        region,
-                        regions
-                            .iter()
-                            .map(|r| r.slug.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                    set_provision_failed(
-                        &nodes_api,
-                        &ctx.k8s,
-                        name,
-                        node_uid,
-                        &hash,
-                        "InvalidConfig",
-                        &msg,
-                    )
-                    .await;
-                    continue;
-                }
-            }
-            Err(e) => {
-                error!(error = %e, node = name, "node-provision: listing regions for validation");
-                continue;
-            }
-        }
-
-        // Validate image slug against BinaryLane API.
-        match ctx.bl.list_images().await {
-            Ok(images) => {
-                if !images
+        // Validate size slug.
+        if !sizes.iter().any(|s| s.slug == *size) {
+            let msg = format!(
+                "unknown size '{}' (available: {})",
+                size,
+                sizes
                     .iter()
-                    .any(|i| i.slug.as_deref() == Some(image.as_str()))
-                {
-                    let msg = format!(
-                        "unknown image '{}' (available: {})",
-                        image,
-                        images
-                            .iter()
-                            .filter_map(|i| i.slug.as_deref())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                    set_provision_failed(
-                        &nodes_api,
-                        &ctx.k8s,
-                        name,
-                        node_uid,
-                        &hash,
-                        "InvalidConfig",
-                        &msg,
-                    )
-                    .await;
-                    continue;
-                }
-            }
-            Err(e) => {
-                error!(error = %e, node = name, "node-provision: listing images for validation");
-                continue;
-            }
+                    .map(|s| s.slug.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            set_provision_failed(
+                &nodes_api,
+                &ctx.k8s,
+                name,
+                node_uid,
+                &hash,
+                "InvalidConfig",
+                &msg,
+            )
+            .await;
+            continue;
+        }
+
+        // Validate region slug.
+        if !regions.iter().any(|r| r.slug == *region) {
+            let msg = format!(
+                "unknown region '{}' (available: {})",
+                region,
+                regions
+                    .iter()
+                    .map(|r| r.slug.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            set_provision_failed(
+                &nodes_api,
+                &ctx.k8s,
+                name,
+                node_uid,
+                &hash,
+                "InvalidConfig",
+                &msg,
+            )
+            .await;
+            continue;
+        }
+
+        // Validate image slug.
+        if !images
+            .iter()
+            .any(|i| i.slug.as_deref() == Some(image.as_str()))
+        {
+            let msg = format!(
+                "unknown image '{}' (available: {})",
+                image,
+                images
+                    .iter()
+                    .filter_map(|i| i.slug.as_deref())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            set_provision_failed(
+                &nodes_api,
+                &ctx.k8s,
+                name,
+                node_uid,
+                &hash,
+                "InvalidConfig",
+                &msg,
+            )
+            .await;
+            continue;
         }
 
         match provision_node(
@@ -254,7 +252,7 @@ async fn set_provision_failed(
 ) {
     warn!(
         node = name,
-        reason, message, "node-provision: validation failed"
+        reason, message, "node-provision: provisioning failed"
     );
 
     let patch = serde_json::json!({
@@ -273,28 +271,6 @@ async fn set_provision_failed(
         .await
     {
         warn!(node = name, error = %e, "failed to set provision-failed annotation");
-    }
-
-    let patch = serde_json::json!({
-        "status": {
-            "conditions": [{
-                "type": "ProvisionFailed",
-                "status": "True",
-                "reason": reason,
-                "message": message,
-                "lastTransitionTime": k8s_openapi::chrono::Utc::now().to_rfc3339(),
-            }]
-        }
-    });
-    if let Err(e) = nodes_api
-        .patch_status(
-            name,
-            &PatchParams::apply("binarylane-controller"),
-            &kube::api::Patch::Merge(&patch),
-        )
-        .await
-    {
-        warn!(node = name, error = %e, "failed to patch ProvisionFailed condition");
     }
 
     emit_event(k8s, name, node_uid, "Warning", "ProvisionFailed", message).await;
@@ -318,29 +294,6 @@ async fn clear_provision_failed(nodes_api: &Api<Node>, name: &str) {
         .await
     {
         warn!(node = name, error = %e, "failed to clear provision-failed annotation");
-    }
-
-    // Clear the ProvisionFailed condition.
-    let patch = serde_json::json!({
-        "status": {
-            "conditions": [{
-                "type": "ProvisionFailed",
-                "status": "False",
-                "reason": "Provisioned",
-                "message": "",
-                "lastTransitionTime": k8s_openapi::chrono::Utc::now().to_rfc3339(),
-            }]
-        }
-    });
-    if let Err(e) = nodes_api
-        .patch_status(
-            name,
-            &PatchParams::apply("binarylane-controller"),
-            &kube::api::Patch::Merge(&patch),
-        )
-        .await
-    {
-        warn!(node = name, error = %e, "failed to clear ProvisionFailed condition");
     }
 }
 
@@ -395,6 +348,30 @@ async fn provision_node(
     node_uid: Option<String>,
 ) -> Result<()> {
     let secrets_api: Api<Secret> = Api::namespaced(ctx.k8s.clone(), &ctx.secret_namespace);
+
+    // Ensure finalizer is present before creating any external resources.
+    let current = nodes_api
+        .get(name)
+        .await
+        .context("getting node for finalizer")?;
+    let has_finalizer = current
+        .metadata
+        .finalizers
+        .as_ref()
+        .is_some_and(|f| f.iter().any(|f| f == super::FINALIZER));
+    if !has_finalizer {
+        let mut finalizers = current.metadata.finalizers.unwrap_or_default();
+        finalizers.push(super::FINALIZER.to_string());
+        let patch = serde_json::json!({ "metadata": { "finalizers": finalizers } });
+        nodes_api
+            .patch(
+                name,
+                &PatchParams::apply("binarylane-controller"),
+                &kube::api::Patch::Merge(&patch),
+            )
+            .await
+            .context("adding finalizer")?;
+    }
 
     // Read or generate password. If no secret exists, generate a password and
     // persist it so it's not lost if server creation fails mid-flight.

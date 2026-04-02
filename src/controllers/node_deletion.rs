@@ -35,9 +35,14 @@ pub async fn reconcile(ctx: &ReconcileContext) {
             .as_ref()
             .is_some_and(|f| f.iter().any(|f| f == FINALIZER));
 
-        // Process nodes that either have a BL provider ID or have our finalizer
-        // (e.g. provisioning nodes that haven't been bound yet).
-        if server_id.is_none() && !has_finalizer {
+        // Process nodes that either have a BL provider ID, have our finalizer,
+        // or are provision candidates.
+        let has_provision_labels = node.metadata.labels.as_ref().is_some_and(|l| {
+            l.contains_key(super::LABEL_SIZE)
+                || l.contains_key(super::LABEL_REGION)
+                || l.contains_key(super::LABEL_IMAGE)
+        });
+        if server_id.is_none() && !has_finalizer && !has_provision_labels {
             continue;
         }
 
@@ -113,8 +118,18 @@ async fn reconcile_node(
         }
     }
 
-    // Ensure finalizer is present (only for bound nodes).
-    if server_id.is_some() && !has_finalizer {
+    // Ensure finalizer is present for bound nodes and provision candidates.
+    let has_provision_labels = node.metadata.labels.as_ref().is_some_and(|l| {
+        l.contains_key(super::LABEL_SIZE)
+            || l.contains_key(super::LABEL_REGION)
+            || l.contains_key(super::LABEL_IMAGE)
+    });
+    let has_adopt = node
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(super::ANNOTATION_ADOPT));
+    if (server_id.is_some() || has_provision_labels || has_adopt) && !has_finalizer {
         let mut finalizers: Vec<String> = node.metadata.finalizers.clone().unwrap_or_default();
         finalizers.push(FINALIZER.to_string());
         let patch = serde_json::json!({

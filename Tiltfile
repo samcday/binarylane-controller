@@ -28,7 +28,7 @@ custom_build(
     registry_image,
     'docker build -t $EXPECTED_REF . -f Dockerfile && ' +
     '_img=$(mktemp) && docker save -o "$_img" "$EXPECTED_REF" && ' +
-    'crane push --insecure "$_img" "$EXPECTED_REF"; rm -f "$_img"',
+    'crane push --insecure "$_img" "$EXPECTED_REF" && rm -f "$_img"',
     deps=["Cargo.toml", "Cargo.lock", "build.rs", "src/", "proto/", "binarylane-client/"],
     skips_local_docker=True,
 )
