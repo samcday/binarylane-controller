@@ -721,7 +721,7 @@ if ! command -v curl >/dev/null 2>&1; then\n\
   fi\n\
 fi\n\
 if ! command -v k3s >/dev/null 2>&1; then\n\
-  curl -sfL https://get.k3s.io | ${{SUDO}} env INSTALL_K3S_EXEC='server --write-kubeconfig-mode 644 --disable traefik --disable servicelb --disable-cloud-controller --kubelet-arg=cloud-provider=external --kubelet-arg=provider-id=binarylane:///{server_id} --tls-san {host}' sh -s -\n\
+  curl -sfL https://get.k3s.io | ${{SUDO}} env INSTALL_K3S_EXEC='server --write-kubeconfig-mode 644 --disable traefik --disable servicelb --disable-cloud-controller --kubelet-arg=provider-id=binarylane:///{server_id} --tls-san {host}' sh -s -\n\
 fi\n\
 ${{SUDO}} systemctl enable --now k3s >/dev/null 2>&1 || true\n\
 ${{SUDO}} systemctl is-active --quiet k3s\n"
