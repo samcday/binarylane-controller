@@ -1,6 +1,3 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use anyhow::{Context, Result};
 use binarylane_client as binarylane;
 use k8s_openapi::api::core::v1::{Event, EventSource, Node, ObjectReference, Secret};
@@ -16,16 +13,18 @@ use super::{
 
 const ANNOTATION_PROVISION_FAILED: &str = "bl.samcday.com/provision-failed-config";
 
-/// Hash the provision-relevant label values so we can detect config changes.
+/// Stable fingerprint of the provision-relevant label values.
 fn config_hash(labels: Option<&std::collections::BTreeMap<String, String>>) -> String {
-    let mut h = DefaultHasher::new();
-    for key in [LABEL_SIZE, LABEL_REGION, LABEL_IMAGE] {
-        labels
-            .and_then(|l| l.get(key))
-            .unwrap_or(&String::new())
-            .hash(&mut h);
-    }
-    format!("{:x}", h.finish())
+    [LABEL_SIZE, LABEL_REGION, LABEL_IMAGE]
+        .iter()
+        .map(|k| {
+            labels
+                .and_then(|l| l.get(*k))
+                .map(|v| v.as_str())
+                .unwrap_or("")
+        })
+        .collect::<Vec<_>>()
+        .join("\0")
 }
 
 pub async fn reconcile(ctx: &ReconcileContext) {
