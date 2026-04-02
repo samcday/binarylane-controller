@@ -131,12 +131,15 @@ async fn test_node_sync() -> Result<()> {
 /// to provision a BL load balancer, update the service to add a second port,
 /// verify the LB updates, then delete and verify cleanup.
 ///
-/// Requires the LB controller to be running and correctly configured for the
-/// cluster's region. Set INTEGRATION_TEST_LB=1 to opt in.
+/// BROKEN: BL LB API semantics are not yet fully understood. Known issues:
+/// - API only returns entry_protocol in forwarding rules (no port fields)
+/// - health_check.protocol must be "both" for mixed http/https
+/// - Region defaults to syd but must match server region
+/// Re-enable with INTEGRATION_TEST_LB=1 once the LB controller is reworked.
 #[tokio::test]
 async fn test_load_balancer_lifecycle() -> Result<()> {
     if std::env::var("INTEGRATION_TEST_LB").is_err() {
-        eprintln!("skipping test_load_balancer_lifecycle: set INTEGRATION_TEST_LB=1 to enable");
+        eprintln!("skipping test_load_balancer_lifecycle: LB controller needs rework (set INTEGRATION_TEST_LB=1 to force)");
         return Ok(());
     }
     let Some(ctx) = TestContext::new().await else {

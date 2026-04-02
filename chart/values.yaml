@@ -63,20 +63,6 @@ resources:
   limits:
     memory: 128Mi
 
-# VIP manager DaemonSet - binds LoadBalancer VIPs to node interfaces
-vipManager:
-  enabled: false
-  image: "alpine:3"
-  interface: eth0
-  interval: "30"
-  loadBalancerClass: "binarylane.com.au/load-balancer"
-  # Override the entire container list (replaces the default shell script)
-  podSpec: null
-  nodeSelector: {}
-  tolerations:
-    - effect: NoSchedule
-      operator: Exists
-
 nodeSelector: {}
 tolerations: []
 affinity: {}

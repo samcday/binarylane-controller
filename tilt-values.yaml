@@ -10,9 +10,6 @@ externalDns:
   mtls:
     enabled: true
 
-vipManager:
-  enabled: true
-
 resources:
   requests:
     cpu: 10m
