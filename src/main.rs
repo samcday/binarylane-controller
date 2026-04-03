@@ -236,9 +236,20 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // Detach controller tasks
+    // Monitor controller tasks — exit if any panic. Clean exits (e.g. from
+    // shutdown_on_signal) are expected and ignored.
     if !handles.is_empty() {
         info!(count = handles.len(), "controllers started");
+        tokio::spawn(async move {
+            let (result, _index, _remaining) = futures::future::select_all(handles).await;
+            match result {
+                Ok(_) => {}
+                Err(e) => {
+                    error!(error = %e, "controller panicked");
+                    std::process::exit(1);
+                }
+            }
+        });
     }
 
     let tls_vars = [&args.tls_cert_path, &args.tls_key_path, &args.tls_ca_path];
