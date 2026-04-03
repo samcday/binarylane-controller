@@ -62,7 +62,10 @@ resources:
     memory: 128Mi
 
 nodeSelector: {}
-tolerations: []
+tolerations:
+  - key: node.cloudprovider.kubernetes.io/uninitialized
+    effect: NoSchedule
+    operator: Exists
 affinity: {}
 
 podAnnotations: {}

@@ -261,6 +261,42 @@ fn main() -> Result<()> {
     }
 }
 
+/// Auto-detect a git worktree and return its directory basename as an instance
+/// name. Returns `None` when running from the main checkout.
+fn detect_worktree_instance() -> Option<String> {
+    let git_dir = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let git_dir = std::str::from_utf8(&git_dir.stdout).ok()?.trim();
+
+    let common_dir = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let common_dir = std::str::from_utf8(&common_dir.stdout).ok()?.trim();
+
+    // In a worktree, --git-dir differs from --git-common-dir.
+    // Canonicalize to handle relative vs absolute paths.
+    let git_dir = fs::canonicalize(git_dir).ok()?;
+    let common_dir = fs::canonicalize(common_dir).ok()?;
+    if git_dir == common_dir {
+        return None;
+    }
+
+    // Use the worktree checkout directory name as the instance.
+    let toplevel = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let toplevel = std::str::from_utf8(&toplevel.stdout).ok()?.trim();
+    let name = Path::new(toplevel).file_name()?.to_str()?;
+    Some(name.to_string())
+}
+
 /// Replace a path field with an instance-scoped value when it still holds its
 /// compile-time default (i.e. the user did not explicitly override it).
 fn override_path_default(field: &mut PathBuf, default: &str, instance_path: &str) {
@@ -356,6 +392,9 @@ fn apply_instance_overrides_down(args: &mut DevDownArgs) {
 
 fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     let t_total = Instant::now();
+    if args.instance.is_none() {
+        args.instance = detect_worktree_instance();
+    }
     apply_instance_overrides_up(&mut args);
     ensure_tool("ssh", "install OpenSSH client")?;
     ensure_tool("ssh-keygen", "install OpenSSH tools")?;
@@ -646,6 +685,9 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
 }
 
 fn cmd_dev_down(mut args: DevDownArgs) -> Result<()> {
+    if args.instance.is_none() {
+        args.instance = detect_worktree_instance();
+    }
     apply_instance_overrides_down(&mut args);
     let state = load_state(&args.state_file)?;
 
@@ -892,7 +934,7 @@ if ! command -v curl >/dev/null 2>&1; then\n\
   fi\n\
 fi\n\
 if ! command -v k3s >/dev/null 2>&1; then\n\
-  curl -sfL https://get.k3s.io | ${{SUDO}} env INSTALL_K3S_EXEC='server --write-kubeconfig-mode 644 --disable traefik --tls-san {host}' sh -s -\n\
+  curl -sfL https://get.k3s.io | ${{SUDO}} env INSTALL_K3S_EXEC='server --write-kubeconfig-mode 644 --disable traefik --disable-cloud-controller --tls-san {host}' sh -s -\n\
 elif [ \"$k3s_was_active\" -eq 1 ] && [ \"$registries_changed\" -eq 1 ]; then\n\
   ${{SUDO}} systemctl restart k3s\n\
 fi\n\

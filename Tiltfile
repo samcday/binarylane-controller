@@ -80,6 +80,10 @@ dev_resources = os.getenv("BL_DEV_RESOURCES", ".dev/dev-resources.generated.yaml
 if os.path.exists(dev_resources):
     k8s_yaml(dev_resources)
 
+# Annotate control plane node for adoption by node-bind controller.
+# In dev there's only the CP node at startup; workers are added by autoscaler.
+local("kubectl annotate node --all bl.samcday.com/adopt= --overwrite 2>/dev/null || true", quiet=True)
+
 # Override helm-generated mTLS secrets with stable dev certs. Applied after
 # controller_manifests so these take precedence.
 k8s_yaml(blob("""
