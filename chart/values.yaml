@@ -23,6 +23,11 @@ serviceAccount:
   annotations: {}
   name: ""
 
+# Additional namespaces the controller may read Secrets from (for cross-namespace
+# secretRefs in AutoScalingGroup resources). A Role + RoleBinding granting Secret
+# read access is created in each listed namespace.
+secretNamespaces: []
+
 # Autoscaler gRPC provider configuration
 autoscaler:
   enabled: false

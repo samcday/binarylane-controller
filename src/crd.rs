@@ -55,6 +55,9 @@ pub struct AutoScalingGroupSpec {
 #[serde(rename_all = "camelCase")]
 pub struct SecretRef {
     pub name: String,
+    /// Namespace of the Secret. Defaults to the controller's namespace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// Key within the Secret. Defaults to "user-data" or "password" depending on context.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,

@@ -1639,6 +1639,7 @@ spec:
   namePrefix: "bl-dev-"
   userDataSecretRef:
     name: dev-cloud-init
+    namespace: binarylane-system
     key: user-data
 "#,
         cloud_init = indent_block(&cloud_init, 4),

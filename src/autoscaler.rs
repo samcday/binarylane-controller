@@ -108,39 +108,43 @@ impl Provider {
         secret_ref: &SecretRef,
         default_key: &str,
     ) -> Result<String, Status> {
+        let namespace = secret_ref
+            .namespace
+            .as_deref()
+            .unwrap_or(&self.secret_namespace);
         let key = secret_ref.key.as_deref().unwrap_or(default_key);
-        let secrets_api: Api<K8sSecret> = Api::namespaced(self.k8s.clone(), &self.secret_namespace);
+        let secrets_api: Api<K8sSecret> = Api::namespaced(self.k8s.clone(), namespace);
         let secret = secrets_api
             .get(&secret_ref.name)
             .await
             .map_err(|e| match e {
                 kube::Error::Api(err) if err.code == 404 => Status::not_found(format!(
                     "secret {}/{} not found",
-                    self.secret_namespace, secret_ref.name
+                    namespace, secret_ref.name
                 )),
                 other => Status::internal(format!(
                     "reading secret {}/{}: {other}",
-                    self.secret_namespace, secret_ref.name
+                    namespace, secret_ref.name
                 )),
             })?;
 
         let data = secret.data.ok_or_else(|| {
             Status::internal(format!(
                 "secret {}/{} has no data",
-                self.secret_namespace, secret_ref.name
+                namespace, secret_ref.name
             ))
         })?;
         let bytes = data.get(key).ok_or_else(|| {
             Status::internal(format!(
                 "secret {}/{} missing key {}",
-                self.secret_namespace, secret_ref.name, key
+                namespace, secret_ref.name, key
             ))
         })?;
 
         String::from_utf8(bytes.0.clone()).map_err(|e| {
             Status::internal(format!(
                 "secret {}/{} key {} is not valid UTF-8: {e}",
-                self.secret_namespace, secret_ref.name, key
+                namespace, secret_ref.name, key
             ))
         })
     }

@@ -86,6 +86,8 @@ spec:
                   properties:
                     name:
                       type: string
+                    namespace:
+                      type: string
                     key:
                       type: string
                 passwordSecretRef:
@@ -93,6 +95,8 @@ spec:
                   required: [name]
                   properties:
                     name:
+                      type: string
+                    namespace:
                       type: string
                     key:
                       type: string
