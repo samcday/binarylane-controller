@@ -27,7 +27,7 @@ const REGISTRY_DATA_HOSTPATH: &str = "/var/lib/binarylane-dev-registry/registry-
 const DEV_AUTOSCALER_GROUP_ID: &str = "workers";
 
 const DEFAULT_REGION: &str = "syd";
-const DEFAULT_SIZE: &str = "std-min";
+const DEFAULT_SIZE: &str = "std-1vcpu";
 const DEFAULT_IMAGE: &str = "ubuntu-24.04";
 const DEFAULT_SSH_USER: &str = "root";
 const DEFAULT_MANAGED_SSH_KEY_PATH: &str = ".dev/dev-control-plane-ed25519";
