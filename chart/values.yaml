@@ -26,15 +26,8 @@ serviceAccount:
 # Autoscaler gRPC provider configuration
 autoscaler:
   enabled: false
-  # Node group configuration (JSON)
-  config: {}
-  # Cloud-init template
-  cloudInit: ""
   # gRPC listen address
   listenAddr: "0.0.0.0:8086"
-
-# Template variables passed as TMPL_* env vars
-templateVars: {}
 
 mtls:
   enabled: true

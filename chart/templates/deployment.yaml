@@ -14,7 +14,6 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
         {{- if $tlsEnabled }}
         checksum/mtls: {{ include (print $.Template.BasePath "/mtls.yaml") . | sha256sum }}
         {{- end }}
@@ -57,10 +56,6 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             {{- if .Values.autoscaler.enabled }}
-            - name: CONFIG_PATH
-              value: /etc/binarylane-controller/config.json
-            - name: CLOUD_INIT_PATH
-              value: /etc/binarylane-controller/cloud-init.sh
             - name: GRPC_LISTEN_ADDR
               value: {{ .Values.autoscaler.listenAddr | quote }}
             {{- end }}
@@ -76,10 +71,6 @@ spec:
             - name: TLS_CA_PATH
               value: /etc/binarylane-controller/tls/ca.crt
             {{- end }}
-            {{- range $key, $value := .Values.templateVars }}
-            - name: TMPL_{{ $key }}
-              value: {{ $value | quote }}
-            {{- end }}
           {{- if or .Values.autoscaler.enabled .Values.externalDns.enabled }}
           ports:
             {{- if .Values.autoscaler.enabled }}
@@ -93,35 +84,21 @@ spec:
               protocol: TCP
             {{- end }}
           {{- end }}
-          {{- if or .Values.autoscaler.enabled $tlsEnabled }}
+          {{- if $tlsEnabled }}
           volumeMounts:
-            {{- if .Values.autoscaler.enabled }}
-            - name: config
-              mountPath: /etc/binarylane-controller
-              readOnly: true
-            {{- end }}
-            {{- if $tlsEnabled }}
             - name: tls
               mountPath: /etc/binarylane-controller/tls
               readOnly: true
-            {{- end }}
           {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-      {{- if or .Values.autoscaler.enabled $tlsEnabled }}
+      {{- if $tlsEnabled }}
       volumes:
-        {{- if .Values.autoscaler.enabled }}
-        - name: config
-          configMap:
-            name: {{ include "binarylane-controller.fullname" . }}
-        {{- end }}
-        {{- if $tlsEnabled }}
         - name: tls
           secret:
             secretName: {{ include "binarylane-controller.fullname" . }}-mtls-server
-        {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

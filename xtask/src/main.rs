@@ -370,6 +370,10 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     let ssh_key_path = absolute_path(&args.ssh_key_path)?;
     let docker_config_dir = absolute_path(&args.docker_config_dir)?;
     let tilt_values_out = absolute_path(&args.tilt_values_out)?;
+    let dev_resources_out = tilt_values_out
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("dev-resources.generated.yaml");
     ensure_dir(&docker_config_dir)?;
     ensure_managed_ssh_keypair(&ssh_key_path)?;
     let ssh_public_key = read_managed_public_key(&ssh_key_path)?;
@@ -576,13 +580,8 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         &registry_username,
         &registry_password,
     )?;
-    write_dev_tilt_values(
-        &tilt_values_out,
-        &args,
-        &account_key.fingerprint,
-        &k3s_url,
-        &k3s_token,
-    )?;
+    write_dev_tilt_values(&tilt_values_out)?;
+    write_dev_resources(&dev_resources_out, &args, &k3s_url, &k3s_token)?;
 
     state.server_id = Some(server.id);
     state.server_name = server.name.clone();
@@ -619,6 +618,7 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     emit_env("BL_API_TOKEN", &args.bl_api_token);
     emit_env("DOCKER_CONFIG", &path_to_string(&docker_config_dir)?);
     emit_env("BL_DEV_TILT_VALUES", &path_to_string(&tilt_values_out)?);
+    emit_env("BL_DEV_RESOURCES", &dev_resources_out.display().to_string());
     emit_env("BL_DEV_SERVER_ID", &server.id.to_string());
     emit_env("BL_DEV_SERVER_NAME", &server.name);
     emit_env("BL_DEV_SERVER_IP", &server_ip);
@@ -1539,49 +1539,16 @@ fn write_docker_config(
     })
 }
 
-fn write_dev_tilt_values(
-    tilt_values_path: &Path,
-    args: &DevUpArgs,
-    ssh_key_fingerprint: &str,
-    k3s_url: &str,
-    k3s_token: &str,
-) -> Result<()> {
+fn write_dev_tilt_values(tilt_values_path: &Path) -> Result<()> {
     ensure_parent_dir(tilt_values_path)?;
 
-    let contents = format!(
-        r#"autoscaler:
+    let contents = r#"autoscaler:
   enabled: true
   listenAddr: "0.0.0.0:8086"
-  config:
-    namePrefix: "bl-dev-"
-    sshKeys:
-      - "{ssh_key_fingerprint}"
-    nodeGroups:
-      - id: "{group_id}"
-        minSize: 0
-        maxSize: 3
-        size: "{size}"
-        region: "{region}"
-        image: "{image}"
-        vcpus: 1
-        memoryMb: 1024
-        diskGb: 25
-        labels:
-          autoscale-group: "{group_id}"
 mtls:
   enabled: true
-templateVars:
-  K3S_URL: "{k3s_url}"
-  K3S_TOKEN: "{k3s_token}"
-"#,
-        ssh_key_fingerprint = yaml_escape(ssh_key_fingerprint),
-        group_id = DEV_AUTOSCALER_GROUP_ID,
-        size = yaml_escape(&args.size),
-        region = yaml_escape(&args.region),
-        image = yaml_escape(&args.image),
-        k3s_url = yaml_escape(k3s_url),
-        k3s_token = yaml_escape(k3s_token),
-    );
+"#
+    .to_string();
 
     fs::write(tilt_values_path, contents).with_context(|| {
         format!(
@@ -1589,6 +1556,59 @@ templateVars:
             tilt_values_path.display()
         )
     })
+}
+
+fn write_dev_resources(
+    resources_path: &Path,
+    args: &DevUpArgs,
+    k3s_url: &str,
+    k3s_token: &str,
+) -> Result<()> {
+    ensure_parent_dir(resources_path)?;
+
+    let cloud_init_template =
+        fs::read_to_string("dev-cloud-init.sh").context("reading dev-cloud-init.sh")?;
+    let cloud_init = cloud_init_template
+        .replace("{{.K3S_URL}}", k3s_url)
+        .replace("{{.K3S_TOKEN}}", k3s_token)
+        .replace("{{.NodeName}}", "$(hostname)")
+        .replace("{{.NodeGroup}}", DEV_AUTOSCALER_GROUP_ID);
+
+    let contents = format!(
+        r#"apiVersion: v1
+kind: Secret
+metadata:
+  name: dev-cloud-init
+  namespace: binarylane-system
+type: Opaque
+stringData:
+  user-data: |
+{cloud_init}---
+apiVersion: blc.samcday.com/v1alpha1
+kind: AutoScalingGroup
+metadata:
+  name: {group_id}
+spec:
+  minSize: 0
+  maxSize: 3
+  size: "{size}"
+  region: "{region}"
+  image: "{image}"
+  namePrefix: "bl-dev-"
+  userDataSecretRef:
+    name: dev-cloud-init
+    namespace: binarylane-system
+    key: user-data
+"#,
+        cloud_init = indent_block(&cloud_init, 4),
+        group_id = DEV_AUTOSCALER_GROUP_ID,
+        size = yaml_escape(&args.size),
+        region = yaml_escape(&args.region),
+        image = yaml_escape(&args.image),
+    );
+
+    fs::write(resources_path, contents)
+        .with_context(|| format!("writing dev resources {}", resources_path.display()))
 }
 
 fn yaml_escape(value: &str) -> String {

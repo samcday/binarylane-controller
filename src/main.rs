@@ -1,17 +1,18 @@
 mod autoscaler;
 use binarylane_client as binarylane;
 mod controllers;
+mod crd;
 mod dns_webhook;
 
 pub mod proto {
     tonic::include_proto!("clusterautoscaler.cloudprovider.v1.externalgrpc");
 }
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use futures::StreamExt;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::{error, info, warn};
 
@@ -21,22 +22,6 @@ struct Args {
     /// BinaryLane API token
     #[arg(long, env = "BL_API_TOKEN")]
     bl_api_token: String,
-
-    /// Path to autoscaler config JSON
-    #[arg(
-        long,
-        env = "CONFIG_PATH",
-        default_value = "/etc/binarylane-controller/config.json"
-    )]
-    config_path: String,
-
-    /// Path to cloud-init template
-    #[arg(
-        long,
-        env = "CLOUD_INIT_PATH",
-        default_value = "/etc/binarylane-controller/cloud-init.sh"
-    )]
-    cloud_init_path: String,
 
     /// gRPC listen address
     #[arg(long, env = "GRPC_LISTEN_ADDR", default_value = "0.0.0.0:8086")]
@@ -217,39 +202,36 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Load autoscaler config
     if !args.cluster_autoscaler_service {
         std::future::pending::<()>().await;
         return Ok(());
     }
 
-    let cfg_data = match tokio::fs::read_to_string(&args.config_path).await {
-        Ok(data) => data,
-        Err(e) => {
-            warn!(path = %args.config_path, error = %e, "autoscaler config not found, gRPC provider disabled");
-            std::future::pending::<()>().await;
-            return Ok(());
-        }
-    };
+    let asg_api: kube::Api<crd::AutoScalingGroup> = kube::Api::all(k8s.clone());
+    let (asg_store, asg_writer) = kube::runtime::reflector::store();
+    tokio::spawn(async move {
+        kube::runtime::reflector::reflector(
+            asg_writer,
+            kube::runtime::watcher::watcher(asg_api, kube::runtime::watcher::Config::default()),
+        )
+        .for_each(|event| async {
+            if let Err(e) = event {
+                warn!(error = %e, "autoscaler ASG reflector watch error");
+            }
+        })
+        .await;
+    });
 
-    let mut cfg: autoscaler::Config =
-        serde_json::from_str(&cfg_data).context("parsing autoscaler config")?;
-
-    let cloud_init = tokio::fs::read_to_string(&args.cloud_init_path)
-        .await
-        .context("reading cloud-init template")?;
-    cfg.cloud_init = cloud_init;
-
-    cfg.template_vars = std::env::vars()
-        .filter_map(|(k, v)| k.strip_prefix("TMPL_").map(|k| (k.to_string(), v)))
-        .collect::<HashMap<_, _>>();
-
-    let provider = autoscaler::Provider::new(k8s.clone(), cfg.clone(), args.pod_namespace.clone());
+    let provider = autoscaler::Provider::new(
+        k8s.clone(),
+        bl.clone(),
+        asg_store,
+        args.pod_namespace.clone(),
+    );
     let svc = proto::cloud_provider_server::CloudProviderServer::new(provider);
 
     info!(
         grpc = %args.grpc_listen_addr,
-        node_groups = cfg.node_groups.len(),
         "binarylane-controller starting"
     );
 
