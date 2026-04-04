@@ -92,11 +92,23 @@ impl ReconcileContext {
             }
         }
 
+        // Take write lock to serialize refreshes — re-check in case another
+        // task already refreshed while we were waiting for the lock.
+        let mut guard = self.bl_catalog.write().await;
+        if let Some(ref cat) = *guard
+            && cat.fetched_at.elapsed() < Duration::from_secs(300)
+        {
+            return Ok(BlCatalogSnapshot {
+                sizes: cat.sizes.clone(),
+                regions: cat.regions.clone(),
+                images: cat.images.clone(),
+            });
+        }
+
         let sizes = self.bl.list_sizes().await?;
         let regions = self.bl.list_regions().await?;
         let images = self.bl.list_images().await?;
 
-        let mut guard = self.bl_catalog.write().await;
         *guard = Some(BlCatalog {
             sizes: sizes.clone(),
             regions: regions.clone(),

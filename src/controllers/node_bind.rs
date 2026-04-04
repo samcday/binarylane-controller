@@ -5,6 +5,7 @@ use kube::api::PatchParams;
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 use super::{ANNOTATION_ADOPT, LABEL_SERVER_ID, ReconcileContext};
@@ -33,15 +34,18 @@ pub async fn reconcile(
         return Ok(Action::await_change());
     }
 
-    if let Err(e) = bind_node(&ctx, &name).await {
-        error!(error = format_args!("{e:#}"), node = %name, "node-bind: binding node");
-        return Err(e.into());
+    match bind_node(&ctx, &name).await {
+        Ok(true) => Ok(Action::await_change()),
+        Ok(false) => Ok(Action::requeue(Duration::from_secs(30))),
+        Err(e) => {
+            error!(error = format_args!("{e:#}"), node = %name, "node-bind: binding node");
+            Err(e.into())
+        }
     }
-
-    Ok(Action::await_change())
 }
 
-async fn bind_node(ctx: &ReconcileContext, name: &str) -> AnyResult<()> {
+/// Returns `true` if the node was bound, `false` if no server was found yet.
+async fn bind_node(ctx: &ReconcileContext, name: &str) -> AnyResult<bool> {
     let nodes_api: Api<Node> = Api::all(ctx.k8s.clone());
 
     let server = ctx
@@ -52,7 +56,7 @@ async fn bind_node(ctx: &ReconcileContext, name: &str) -> AnyResult<()> {
 
     let Some(server) = server else {
         warn!(node = name, "no BinaryLane server found matching hostname");
-        return Ok(());
+        return Ok(false);
     };
 
     info!(
@@ -83,5 +87,5 @@ async fn bind_node(ctx: &ReconcileContext, name: &str) -> AnyResult<()> {
         .await
         .context("patching node with provider ID")?;
 
-    Ok(())
+    Ok(true)
 }
