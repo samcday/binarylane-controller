@@ -23,18 +23,16 @@ serviceAccount:
   annotations: {}
   name: ""
 
+# Additional namespaces the controller may read Secrets from (for cross-namespace
+# secretRefs in AutoScalingGroup resources). A Role + RoleBinding granting Secret
+# read access is created in each listed namespace.
+secretNamespaces: []
+
 # Autoscaler gRPC provider configuration
 autoscaler:
   enabled: false
-  # Node group configuration (JSON)
-  config: {}
-  # Cloud-init template
-  cloudInit: ""
   # gRPC listen address
   listenAddr: "0.0.0.0:8086"
-
-# Template variables passed as TMPL_* env vars
-templateVars: {}
 
 mtls:
   enabled: true
@@ -69,7 +67,10 @@ resources:
     memory: 128Mi
 
 nodeSelector: {}
-tolerations: []
+tolerations:
+  - key: node.cloudprovider.kubernetes.io/uninitialized
+    effect: NoSchedule
+    operator: Exists
 affinity: {}
 
 podAnnotations: {}

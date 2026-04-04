@@ -21,7 +21,7 @@ spec:
                 app: scale-test
             topologyKey: kubernetes.io/hostname
       nodeSelector:
-        autoscale-group: workers
+        blc.samcday.com/asg: workers
       containers:
       - name: httpbin
         image: mccutchen/go-httpbin:v2.15.0

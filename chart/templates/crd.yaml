@@ -1,0 +1,114 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: autoscalinggroups.blc.samcday.com
+  annotations:
+    "helm.sh/resource-policy": keep
+spec:
+  group: blc.samcday.com
+  names:
+    kind: AutoScalingGroup
+    listKind: AutoScalingGroupList
+    plural: autoscalinggroups
+    singular: autoscalinggroup
+    shortNames:
+      - asg
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Min
+          type: integer
+          jsonPath: .spec.minSize
+        - name: Max
+          type: integer
+          jsonPath: .spec.maxSize
+        - name: Replicas
+          type: integer
+          jsonPath: .status.replicas
+        - name: Last Scale Up
+          type: date
+          jsonPath: .status.lastScaleUp
+        - name: Last Scale Down
+          type: date
+          jsonPath: .status.lastScaleDown
+        - name: Size
+          type: string
+          jsonPath: .spec.size
+          priority: 1
+        - name: Region
+          type: string
+          jsonPath: .spec.region
+          priority: 1
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+          priority: 1
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [minSize, maxSize, size, region, image]
+              properties:
+                minSize:
+                  type: integer
+                  format: int32
+                maxSize:
+                  type: integer
+                  format: int32
+                size:
+                  type: string
+                region:
+                  type: string
+                image:
+                  type: string
+                vcpus:
+                  type: integer
+                  format: int32
+                memoryMb:
+                  type: integer
+                  format: int32
+                diskGb:
+                  type: integer
+                  format: int32
+                namePrefix:
+                  type: string
+                  default: ""
+                userDataSecretRef:
+                  type: object
+                  required: [name]
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    key:
+                      type: string
+                passwordSecretRef:
+                  type: object
+                  required: [name]
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    key:
+                      type: string
+            status:
+              type: object
+              properties:
+                replicas:
+                  type: integer
+                  format: int32
+                lastScaleUp:
+                  type: string
+                  format: date-time
+                lastScaleDown:
+                  type: string
+                  format: date-time

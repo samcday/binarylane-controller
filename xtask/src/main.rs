@@ -27,7 +27,7 @@ const REGISTRY_DATA_HOSTPATH: &str = "/var/lib/binarylane-dev-registry/registry-
 const DEV_AUTOSCALER_GROUP_ID: &str = "workers";
 
 const DEFAULT_REGION: &str = "syd";
-const DEFAULT_SIZE: &str = "std-min";
+const DEFAULT_SIZE: &str = "std-1vcpu";
 const DEFAULT_IMAGE: &str = "ubuntu-24.04";
 const DEFAULT_SSH_USER: &str = "root";
 const DEFAULT_MANAGED_SSH_KEY_PATH: &str = ".dev/dev-control-plane-ed25519";
@@ -261,6 +261,42 @@ fn main() -> Result<()> {
     }
 }
 
+/// Auto-detect a git worktree and return its directory basename as an instance
+/// name. Returns `None` when running from the main checkout.
+fn detect_worktree_instance() -> Option<String> {
+    let git_dir = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let git_dir = std::str::from_utf8(&git_dir.stdout).ok()?.trim();
+
+    let common_dir = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let common_dir = std::str::from_utf8(&common_dir.stdout).ok()?.trim();
+
+    // In a worktree, --git-dir differs from --git-common-dir.
+    // Canonicalize to handle relative vs absolute paths.
+    let git_dir = fs::canonicalize(git_dir).ok()?;
+    let common_dir = fs::canonicalize(common_dir).ok()?;
+    if git_dir == common_dir {
+        return None;
+    }
+
+    // Use the worktree checkout directory name as the instance.
+    let toplevel = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let toplevel = std::str::from_utf8(&toplevel.stdout).ok()?.trim();
+    let name = Path::new(toplevel).file_name()?.to_str()?;
+    Some(name.to_string())
+}
+
 /// Replace a path field with an instance-scoped value when it still holds its
 /// compile-time default (i.e. the user did not explicitly override it).
 fn override_path_default(field: &mut PathBuf, default: &str, instance_path: &str) {
@@ -356,6 +392,9 @@ fn apply_instance_overrides_down(args: &mut DevDownArgs) {
 
 fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     let t_total = Instant::now();
+    if args.instance.is_none() {
+        args.instance = detect_worktree_instance();
+    }
     apply_instance_overrides_up(&mut args);
     ensure_tool("ssh", "install OpenSSH client")?;
     ensure_tool("ssh-keygen", "install OpenSSH tools")?;
@@ -370,6 +409,10 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     let ssh_key_path = absolute_path(&args.ssh_key_path)?;
     let docker_config_dir = absolute_path(&args.docker_config_dir)?;
     let tilt_values_out = absolute_path(&args.tilt_values_out)?;
+    let dev_resources_out = tilt_values_out
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("dev-resources.generated.yaml");
     ensure_dir(&docker_config_dir)?;
     ensure_managed_ssh_keypair(&ssh_key_path)?;
     let ssh_public_key = read_managed_public_key(&ssh_key_path)?;
@@ -576,13 +619,8 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         &registry_username,
         &registry_password,
     )?;
-    write_dev_tilt_values(
-        &tilt_values_out,
-        &args,
-        &account_key.fingerprint,
-        &k3s_url,
-        &k3s_token,
-    )?;
+    write_dev_tilt_values(&tilt_values_out)?;
+    write_dev_resources(&dev_resources_out, &args, &k3s_url, &k3s_token)?;
 
     state.server_id = Some(server.id);
     state.server_name = server.name.clone();
@@ -619,6 +657,7 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     emit_env("BL_API_TOKEN", &args.bl_api_token);
     emit_env("DOCKER_CONFIG", &path_to_string(&docker_config_dir)?);
     emit_env("BL_DEV_TILT_VALUES", &path_to_string(&tilt_values_out)?);
+    emit_env("BL_DEV_RESOURCES", &dev_resources_out.display().to_string());
     emit_env("BL_DEV_SERVER_ID", &server.id.to_string());
     emit_env("BL_DEV_SERVER_NAME", &server.name);
     emit_env("BL_DEV_SERVER_IP", &server_ip);
@@ -646,6 +685,9 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
 }
 
 fn cmd_dev_down(mut args: DevDownArgs) -> Result<()> {
+    if args.instance.is_none() {
+        args.instance = detect_worktree_instance();
+    }
     apply_instance_overrides_down(&mut args);
     let state = load_state(&args.state_file)?;
 
@@ -892,7 +934,7 @@ if ! command -v curl >/dev/null 2>&1; then\n\
   fi\n\
 fi\n\
 if ! command -v k3s >/dev/null 2>&1; then\n\
-  curl -sfL https://get.k3s.io | ${{SUDO}} env INSTALL_K3S_EXEC='server --write-kubeconfig-mode 644 --disable traefik --tls-san {host}' sh -s -\n\
+  curl -sfL https://get.k3s.io | ${{SUDO}} env INSTALL_K3S_EXEC='server --write-kubeconfig-mode 644 --disable traefik --disable-cloud-controller --tls-san {host}' sh -s -\n\
 elif [ \"$k3s_was_active\" -eq 1 ] && [ \"$registries_changed\" -eq 1 ]; then\n\
   ${{SUDO}} systemctl restart k3s\n\
 fi\n\
@@ -1539,49 +1581,18 @@ fn write_docker_config(
     })
 }
 
-fn write_dev_tilt_values(
-    tilt_values_path: &Path,
-    args: &DevUpArgs,
-    ssh_key_fingerprint: &str,
-    k3s_url: &str,
-    k3s_token: &str,
-) -> Result<()> {
+fn write_dev_tilt_values(tilt_values_path: &Path) -> Result<()> {
     ensure_parent_dir(tilt_values_path)?;
 
-    let contents = format!(
-        r#"autoscaler:
+    let contents = r#"autoscaler:
   enabled: true
   listenAddr: "0.0.0.0:8086"
-  config:
-    namePrefix: "bl-dev-"
-    sshKeys:
-      - "{ssh_key_fingerprint}"
-    nodeGroups:
-      - id: "{group_id}"
-        minSize: 0
-        maxSize: 3
-        size: "{size}"
-        region: "{region}"
-        image: "{image}"
-        vcpus: 1
-        memoryMb: 1024
-        diskGb: 25
-        labels:
-          autoscale-group: "{group_id}"
 mtls:
   enabled: true
-templateVars:
-  K3S_URL: "{k3s_url}"
-  K3S_TOKEN: "{k3s_token}"
-"#,
-        ssh_key_fingerprint = yaml_escape(ssh_key_fingerprint),
-        group_id = DEV_AUTOSCALER_GROUP_ID,
-        size = yaml_escape(&args.size),
-        region = yaml_escape(&args.region),
-        image = yaml_escape(&args.image),
-        k3s_url = yaml_escape(k3s_url),
-        k3s_token = yaml_escape(k3s_token),
-    );
+secretNamespaces:
+  - default
+"#
+    .to_string();
 
     fs::write(tilt_values_path, contents).with_context(|| {
         format!(
@@ -1589,6 +1600,59 @@ templateVars:
             tilt_values_path.display()
         )
     })
+}
+
+fn write_dev_resources(
+    resources_path: &Path,
+    args: &DevUpArgs,
+    k3s_url: &str,
+    k3s_token: &str,
+) -> Result<()> {
+    ensure_parent_dir(resources_path)?;
+
+    let cloud_init_template =
+        fs::read_to_string("dev-cloud-init.sh").context("reading dev-cloud-init.sh")?;
+    let cloud_init = cloud_init_template
+        .replace("{{.K3S_URL}}", k3s_url)
+        .replace("{{.K3S_TOKEN}}", k3s_token)
+        .replace("{{.NodeName}}", "$(hostname)")
+        .replace("{{.NodeGroup}}", DEV_AUTOSCALER_GROUP_ID);
+
+    let contents = format!(
+        r#"apiVersion: v1
+kind: Secret
+metadata:
+  name: dev-cloud-init
+  namespace: default
+type: Opaque
+stringData:
+  user-data: |
+{cloud_init}---
+apiVersion: blc.samcday.com/v1alpha1
+kind: AutoScalingGroup
+metadata:
+  name: {group_id}
+spec:
+  minSize: 0
+  maxSize: 3
+  size: "{size}"
+  region: "{region}"
+  image: "{image}"
+  namePrefix: "bl-dev-"
+  userDataSecretRef:
+    name: dev-cloud-init
+    namespace: default
+    key: user-data
+"#,
+        cloud_init = indent_block(&cloud_init, 4),
+        group_id = DEV_AUTOSCALER_GROUP_ID,
+        size = yaml_escape(&args.size),
+        region = yaml_escape(&args.region),
+        image = yaml_escape(&args.image),
+    );
+
+    fs::write(resources_path, contents)
+        .with_context(|| format!("writing dev resources {}", resources_path.display()))
 }
 
 fn yaml_escape(value: &str) -> String {
