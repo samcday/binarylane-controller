@@ -103,7 +103,7 @@ pub struct ListedSize {
     pub disk: i32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ListedRegion {
     pub slug: String,
 }

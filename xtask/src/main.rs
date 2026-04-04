@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -9,6 +10,10 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use bcrypt::hash;
 use clap::{Args, Parser, Subcommand};
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::{Namespace, Node, Secret, Service, ServiceAccount};
+use kube::api::{Patch, PatchParams};
+use kube::{Api, ResourceExt};
 use rand::distributions::Alphanumeric;
 use rand::{Rng, thread_rng};
 use serde::{Deserialize, Serialize};
@@ -545,40 +550,7 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         t.elapsed().as_secs_f64()
     );
 
-    let registry_config = RegistryConfig {
-        host: &registry_host,
-        username: &registry_username,
-        password: &registry_password,
-        htpasswd: &registry_htpasswd,
-        secret_name: &args.registry_secret_name,
-    };
-
-    let t = Instant::now();
-    ensure_dev_registry(
-        &server_ip,
-        &ssh_user,
-        Some(&ssh_key_path),
-        &args.known_hosts,
-        &registry_config,
-        timeout,
-    )?;
-    eprintln!(
-        "  registry deployed ....... {:.1}s",
-        t.elapsed().as_secs_f64()
-    );
-
-    let t = Instant::now();
-    wait_for_registry(
-        &registry_host,
-        &registry_username,
-        &registry_password,
-        timeout,
-    )?;
-    eprintln!(
-        "  registry http ready ..... {:.1}s",
-        t.elapsed().as_secs_f64()
-    );
-
+    // -- Last SSH calls: grab kubeconfig + token, then no more SSH --
     let raw_kubeconfig = read_remote_file(
         &server_ip,
         &ssh_user,
@@ -604,13 +576,14 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     }
 
     let k3s_url = format!("https://{}:6443", server_ip);
-    let kubeconfig = rewrite_kubeconfig_server(&raw_kubeconfig, &k3s_url);
+    let kubeconfig_str = rewrite_kubeconfig_server(&raw_kubeconfig, &k3s_url);
     let registry_image_repo = format!("{}/binarylane-controller", registry_host);
 
-    fs::write(&args.kubeconfig_out, kubeconfig).with_context(|| {
+    let kubeconfig_out_abs = absolute_path(&args.kubeconfig_out)?;
+    fs::write(&kubeconfig_out_abs, &kubeconfig_str).with_context(|| {
         format!(
             "writing local kubeconfig to {}",
-            args.kubeconfig_out.display()
+            kubeconfig_out_abs.display()
         )
     })?;
     write_docker_config(
@@ -621,6 +594,95 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     )?;
     write_dev_tilt_values(&tilt_values_out)?;
     write_dev_resources(&dev_resources_out, &args, &k3s_url, &k3s_token)?;
+
+    // -- From here: kube-rs only, no more SSH --
+    let t = Instant::now();
+    let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
+    let kube_init_config = Arc::new(KubeInitConfig {
+        registry_host: registry_host.clone(),
+        registry_username: registry_username.clone(),
+        registry_password: registry_password.clone(),
+        registry_htpasswd: registry_htpasswd.clone(),
+        registry_secret_name: args.registry_secret_name.clone(),
+    });
+    rt.block_on(async {
+        let kubeconfig = kube::config::Kubeconfig::read_from(&kubeconfig_out_abs)
+            .context("reading kubeconfig for kube client")?;
+        let config = kube::Config::from_custom_kubeconfig(kubeconfig, &Default::default())
+            .await
+            .context("building kube config")?;
+        let client = kube::Client::try_from(config).context("building kube client")?;
+
+        // Verify API server is reachable before spawning tasks.
+        wait_for_api_server(&client).await?;
+        eprintln!(
+            "  kube api ready .......... {:.1}s",
+            t.elapsed().as_secs_f64()
+        );
+
+        let cfg = kube_init_config.clone();
+        let t_taint = Instant::now();
+        let t_registry = Instant::now();
+
+        let h_taint = tokio::spawn({
+            let client = client.clone();
+            async move {
+                remove_node_taints(&client).await?;
+                eprintln!(
+                    "  taint removed ........... {:.1}s",
+                    t_taint.elapsed().as_secs_f64()
+                );
+                Ok::<(), anyhow::Error>(())
+            }
+        });
+
+        let h_registry = tokio::spawn({
+            let client = client.clone();
+            let cfg = cfg.clone();
+            async move {
+                deploy_registry(&client, &cfg).await?;
+                eprintln!(
+                    "  registry deployed ....... {:.1}s",
+                    t_registry.elapsed().as_secs_f64()
+                );
+                wait_for_registry_http(
+                    &cfg.registry_host,
+                    &cfg.registry_username,
+                    &cfg.registry_password,
+                )
+                .await?;
+                eprintln!(
+                    "  registry http ready ..... {:.1}s",
+                    t_registry.elapsed().as_secs_f64()
+                );
+                Ok::<(), anyhow::Error>(())
+            }
+        });
+
+        let h_secrets = tokio::spawn({
+            let client = client.clone();
+            let cfg = cfg.clone();
+            async move { ensure_pull_secrets(&client, &cfg).await }
+        });
+
+        let h_sa = tokio::spawn({
+            let client = client.clone();
+            let cfg = cfg.clone();
+            async move { patch_service_accounts(&client, &cfg).await }
+        });
+
+        h_taint.await.context("taint task panicked")??;
+        h_registry.await.context("registry task panicked")??;
+        h_secrets.await.context("secrets task panicked")??;
+        h_sa.await.context("sa task panicked")??;
+
+        Ok::<(), anyhow::Error>(())
+    })
+    .context("kube cluster init failed")?;
+    eprintln!(
+        "  cluster init ............ {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
 
     state.server_id = Some(server.id);
     state.server_name = server.name.clone();
@@ -934,7 +996,7 @@ if ! command -v curl >/dev/null 2>&1; then\n\
   fi\n\
 fi\n\
 if ! command -v k3s >/dev/null 2>&1; then\n\
-  curl -sfL https://get.k3s.io | ${{SUDO}} env INSTALL_K3S_EXEC='server --write-kubeconfig-mode 644 --disable traefik --disable-cloud-controller --tls-san {host}' sh -s -\n\
+  curl -sfL https://get.k3s.io | ${{SUDO}} env INSTALL_K3S_EXEC='server --write-kubeconfig-mode 644 --disable traefik --disable-cloud-controller --kubelet-arg=cloud-provider=external --tls-san {host}' sh -s -\n\
 elif [ \"$k3s_was_active\" -eq 1 ] && [ \"$registries_changed\" -eq 1 ]; then\n\
   ${{SUDO}} systemctl restart k3s\n\
 fi\n\
@@ -967,12 +1029,12 @@ ${{SUDO}} systemctl is-active --quiet k3s\n",
     }
 }
 
-struct RegistryConfig<'a> {
-    host: &'a str,
-    username: &'a str,
-    password: &'a str,
-    htpasswd: &'a str,
-    secret_name: &'a str,
+struct KubeInitConfig {
+    registry_host: String,
+    registry_username: String,
+    registry_password: String,
+    registry_htpasswd: String,
+    registry_secret_name: String,
 }
 
 struct K3sRegistryConfig<'a> {
@@ -981,195 +1043,244 @@ struct K3sRegistryConfig<'a> {
     password: &'a str,
 }
 
-fn ensure_dev_registry(
-    host: &str,
-    user: &str,
-    ssh_key_path: Option<&Path>,
-    known_hosts: &Path,
-    registry: &RegistryConfig<'_>,
-    timeout: Duration,
-) -> Result<()> {
-    eprintln!(
-        "Deploying authenticated dev registry at http://{}...",
-        registry.host
-    );
-
-    let manifest = format!(
-        r#"apiVersion: v1
-kind: Namespace
-metadata:
-  name: {ns}
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: registry
-  namespace: {ns}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: registry
-  template:
-    metadata:
-      labels:
-        app: registry
-    spec:
-      containers:
-        - name: registry
-          image: registry:2
-          imagePullPolicy: IfNotPresent
-          env:
-            - name: REGISTRY_AUTH
-              value: htpasswd
-            - name: REGISTRY_AUTH_HTPASSWD_REALM
-              value: dev
-            - name: REGISTRY_AUTH_HTPASSWD_PATH
-              value: /auth/htpasswd
-          ports:
-            - containerPort: 5000
-              name: http
-          volumeMounts:
-            - name: data
-              mountPath: /var/lib/registry
-            - name: auth
-              mountPath: /auth/htpasswd
-              subPath: htpasswd
-          securityContext:
-            runAsUser: 0
-            runAsGroup: 0
-      volumes:
-        - name: data
-          hostPath:
-            path: {registry_data_hostpath}
-            type: DirectoryOrCreate
-        - name: auth
-          secret:
-            secretName: registry-auth
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: registry-auth
-  namespace: {ns}
-type: Opaque
-stringData:
-  htpasswd: |
-{registry_htpasswd}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: registry
-  namespace: {ns}
-spec:
-  type: NodePort
-  selector:
-    app: registry
-  ports:
-    - name: http
-      port: 5000
-      targetPort: 5000
-      nodePort: 30500
-"#,
-        ns = REGISTRY_NAMESPACE,
-        registry_data_hostpath = REGISTRY_DATA_HOSTPATH,
-        registry_htpasswd = indent_block(registry.htpasswd, 4),
-    );
-
-    let default_sa_patch = format!(
-        r#"{{"imagePullSecrets":[{{"name":"{}"}}]}}"#,
-        registry.secret_name
-    );
-
-    let script = format!(
-        r#"set -eu
-if [ "$(id -u)" -eq 0 ]; then
-  SUDO=""
-else
-  SUDO="sudo"
-fi
-cat <<'EOF_MANIFEST' | ${{SUDO}} kubectl apply -f -
-{manifest}
-EOF_MANIFEST
-for ns in {registry_ns} default binarylane-system; do
-  ${{SUDO}} kubectl get namespace "$ns" >/dev/null 2>&1 || ${{SUDO}} kubectl create namespace "$ns"
-  ${{SUDO}} kubectl -n "$ns" create secret docker-registry {registry_secret_name} \
-    --docker-server={registry_host} \
-    --docker-username={registry_username} \
-    --docker-password={registry_password} \
-    --dry-run=client -o yaml | ${{SUDO}} kubectl apply -f -
-done
-for ns in default; do
-  ${{SUDO}} kubectl -n "$ns" patch serviceaccount default --type='merge' -p={default_sa_patch} >/dev/null
-done
-${{SUDO}} kubectl -n {registry_ns} rollout status deployment/registry --timeout=300s
-"#,
-        manifest = manifest,
-        registry_ns = REGISTRY_NAMESPACE,
-        registry_secret_name = shell_single_quote(registry.secret_name),
-        registry_host = shell_single_quote(registry.host),
-        registry_username = shell_single_quote(registry.username),
-        registry_password = shell_single_quote(registry.password),
-        default_sa_patch = shell_single_quote(&default_sa_patch),
-    );
-
-    let start = Instant::now();
-    loop {
-        match run_ssh_script(
-            host,
-            user,
-            ssh_key_path,
-            known_hosts,
-            &script,
-            SshOutputMode::Forward,
-        ) {
-            Ok(_) => {
-                eprintln!("Dev registry is configured");
-                return Ok(());
-            }
-            Err(err) => {
-                if start.elapsed() > timeout {
-                    return Err(err).context("timed out deploying dev registry");
+async fn wait_for_api_server(client: &kube::Client) -> Result<()> {
+    let nodes: Api<Node> = Api::all(client.clone());
+    for attempt in 1u32.. {
+        match nodes.list(&Default::default()).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                if attempt > 60 {
+                    bail!("timed out waiting for kube API server: {e:#}");
                 }
-                eprintln!("dev registry not ready yet: {err}");
-                thread::sleep(Duration::from_secs(10));
+                if attempt == 1 || attempt % 5 == 0 {
+                    eprintln!("Waiting for kube API server ({e})...");
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
     }
+    unreachable!()
 }
 
-fn wait_for_registry(
+async fn remove_node_taints(client: &kube::Client) -> Result<()> {
+    let nodes: Api<Node> = Api::all(client.clone());
+    let node_list = nodes
+        .list(&Default::default())
+        .await
+        .context("listing nodes")?;
+    for node in &node_list {
+        let name = node.name_any();
+        let taints = node
+            .spec
+            .as_ref()
+            .and_then(|s| s.taints.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let has_taint = taints
+            .iter()
+            .any(|t| t.key == "node.cloudprovider.kubernetes.io/uninitialized");
+        if !has_taint {
+            continue;
+        }
+        let new_taints: Vec<serde_json::Value> = taints
+            .iter()
+            .filter(|t| t.key != "node.cloudprovider.kubernetes.io/uninitialized")
+            .map(|t| {
+                let mut v = serde_json::json!({
+                    "key": t.key,
+                    "effect": t.effect,
+                });
+                if let Some(val) = &t.value {
+                    v["value"] = serde_json::json!(val);
+                }
+                if let Some(ts) = &t.time_added {
+                    v["timeAdded"] = serde_json::json!(ts.0.to_rfc3339());
+                }
+                v
+            })
+            .collect();
+        // Use strategic merge patch via application/strategic-merge-patch+json.
+        // For taints (merge key: "key"), setting the list replaces it entirely
+        // when using a regular merge patch.
+        let patch = serde_json::json!({ "spec": { "taints": new_taints } });
+        nodes
+            .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+            .with_context(|| format!("removing taint from node {name}"))?;
+        // Verify
+        let updated = nodes
+            .get(&name)
+            .await
+            .context("re-reading node after taint patch")?;
+        let still_tainted = updated
+            .spec
+            .as_ref()
+            .and_then(|s| s.taints.as_ref())
+            .is_some_and(|t| {
+                t.iter()
+                    .any(|t| t.key == "node.cloudprovider.kubernetes.io/uninitialized")
+            });
+        if still_tainted {
+            bail!("taint still present on node {name} after patch");
+        }
+        eprintln!("Removed uninitialized taint from node {name}");
+    }
+    Ok(())
+}
+
+async fn deploy_registry(client: &kube::Client, cfg: &KubeInitConfig) -> Result<()> {
+    let pp = PatchParams::apply("xtask").force();
+
+    // Namespace
+    let ns_api: Api<Namespace> = Api::all(client.clone());
+    ns_api
+        .patch(
+            REGISTRY_NAMESPACE,
+            &pp,
+            &Patch::Apply(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": REGISTRY_NAMESPACE }
+            })),
+        )
+        .await
+        .context("applying registry namespace")?;
+
+    // Auth secret
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), REGISTRY_NAMESPACE);
+    secrets
+        .patch(
+            "registry-auth",
+            &pp,
+            &Patch::Apply(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": { "name": "registry-auth", "namespace": REGISTRY_NAMESPACE },
+                "type": "Opaque",
+                "stringData": { "htpasswd": cfg.registry_htpasswd }
+            })),
+        )
+        .await
+        .context("applying registry auth secret")?;
+
+    // Deployment (no toleration — taint is removed by parallel task)
+    let deploys: Api<Deployment> = Api::namespaced(client.clone(), REGISTRY_NAMESPACE);
+    deploys
+        .patch(
+            "registry",
+            &pp,
+            &Patch::Apply(serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": { "name": "registry", "namespace": REGISTRY_NAMESPACE },
+                "spec": {
+                    "replicas": 1,
+                    "selector": { "matchLabels": { "app": "registry" } },
+                    "template": {
+                        "metadata": { "labels": { "app": "registry" } },
+                        "spec": {
+                            "containers": [{
+                                "name": "registry",
+                                "image": "registry:2",
+                                "imagePullPolicy": "IfNotPresent",
+                                "env": [
+                                    { "name": "REGISTRY_AUTH", "value": "htpasswd" },
+                                    { "name": "REGISTRY_AUTH_HTPASSWD_REALM", "value": "dev" },
+                                    { "name": "REGISTRY_AUTH_HTPASSWD_PATH", "value": "/auth/htpasswd" },
+                                ],
+                                "ports": [{ "containerPort": 5000, "name": "http" }],
+                                "volumeMounts": [
+                                    { "name": "data", "mountPath": "/var/lib/registry" },
+                                    { "name": "auth", "mountPath": "/auth/htpasswd", "subPath": "htpasswd" },
+                                ],
+                                "securityContext": { "runAsUser": 0, "runAsGroup": 0 },
+                            }],
+                            "volumes": [
+                                { "name": "data", "hostPath": { "path": REGISTRY_DATA_HOSTPATH, "type": "DirectoryOrCreate" } },
+                                { "name": "auth", "secret": { "secretName": "registry-auth" } },
+                            ],
+                        }
+                    }
+                }
+            })),
+        )
+        .await
+        .context("applying registry deployment")?;
+
+    // Service
+    let svcs: Api<Service> = Api::namespaced(client.clone(), REGISTRY_NAMESPACE);
+    svcs.patch(
+        "registry",
+        &pp,
+        &Patch::Apply(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "registry", "namespace": REGISTRY_NAMESPACE },
+            "spec": {
+                "type": "NodePort",
+                "selector": { "app": "registry" },
+                "ports": [{
+                    "name": "http",
+                    "port": 5000,
+                    "targetPort": 5000,
+                    "nodePort": 30500,
+                }]
+            }
+        })),
+    )
+    .await
+    .context("applying registry service")?;
+
+    // Wait for rollout
+    for attempt in 1u32.. {
+        let deploy = deploys
+            .get("registry")
+            .await
+            .context("getting registry deployment")?;
+        let status = deploy.status.as_ref();
+        let ready = status.and_then(|s| s.ready_replicas).unwrap_or(0);
+        let replicas = status.and_then(|s| s.replicas).unwrap_or(0);
+        let unavailable = status.and_then(|s| s.unavailable_replicas).unwrap_or(0);
+        if ready >= 1 {
+            return Ok(());
+        }
+        if attempt % 10 == 1 {
+            eprintln!(
+                "Registry rollout: replicas={replicas} ready={ready} unavailable={unavailable} ({attempt}s)"
+            );
+        }
+        if attempt > 300 {
+            bail!("timed out waiting for registry deployment rollout");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    unreachable!()
+}
+
+async fn wait_for_registry_http(
     registry_host: &str,
     registry_username: &str,
     registry_password: &str,
-    timeout: Duration,
 ) -> Result<()> {
     eprintln!(
         "Waiting for registry endpoint http://{}/v2/ ...",
         registry_host
     );
-
-    let client = reqwest::blocking::Client::builder()
+    let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .context("building HTTP client for registry probe")?;
 
     let start = Instant::now();
     loop {
-        let resp = client
+        let resp = http
             .get(format!("http://{registry_host}/v2/"))
             .basic_auth(registry_username, Some(registry_password))
-            .send();
+            .send()
+            .await;
 
         match resp {
-            Ok(resp) if resp.status().is_success() => {
-                eprintln!(
-                    "Registry endpoint is reachable ({:.0}s)",
-                    start.elapsed().as_secs_f64()
-                );
-                return Ok(());
-            }
+            Ok(resp) if resp.status().is_success() => return Ok(()),
             Ok(resp) => {
                 eprintln!(
                     "Registry probe: status {} ({:.0}s)",
@@ -1186,15 +1297,84 @@ fn wait_for_registry(
             }
         }
 
-        if start.elapsed() > timeout {
+        if start.elapsed() > Duration::from_secs(300) {
             bail!(
                 "timed out waiting for registry endpoint http://{}/v2/",
                 registry_host
             );
         }
-
-        thread::sleep(Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+async fn ensure_pull_secrets(client: &kube::Client, cfg: &KubeInitConfig) -> Result<()> {
+    let docker_config = serde_json::json!({
+        "auths": {
+            &cfg.registry_host: {
+                "username": &cfg.registry_username,
+                "password": &cfg.registry_password,
+            }
+        }
+    });
+    let docker_config_bytes = serde_json::to_vec(&docker_config)?;
+
+    let pp = PatchParams::apply("xtask").force();
+    for ns_name in [REGISTRY_NAMESPACE, "default", "binarylane-system"] {
+        // Ensure namespace
+        let ns_api: Api<Namespace> = Api::all(client.clone());
+        ns_api
+            .patch(
+                ns_name,
+                &pp,
+                &Patch::Apply(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": { "name": ns_name }
+                })),
+            )
+            .await
+            .with_context(|| format!("ensuring namespace {ns_name}"))?;
+
+        // Apply docker-registry secret
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), ns_name);
+        secrets
+            .patch(
+                &cfg.registry_secret_name,
+                &pp,
+                &Patch::Apply(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "metadata": { "name": &cfg.registry_secret_name, "namespace": ns_name },
+                    "type": "kubernetes.io/dockerconfigjson",
+                    "data": {
+                        ".dockerconfigjson": base64::engine::general_purpose::STANDARD.encode(&docker_config_bytes),
+                    }
+                })),
+            )
+            .await
+            .with_context(|| format!("applying pull secret in {ns_name}"))?;
+    }
+    Ok(())
+}
+
+async fn patch_service_accounts(client: &kube::Client, cfg: &KubeInitConfig) -> Result<()> {
+    let sa_api: Api<ServiceAccount> = Api::namespaced(client.clone(), "default");
+    // Wait for default SA to exist
+    for attempt in 1u32.. {
+        match sa_api.get("default").await {
+            Ok(_) => break,
+            Err(_) if attempt > 60 => bail!("timed out waiting for default service account"),
+            Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
+        }
+    }
+    let patch = serde_json::json!({
+        "imagePullSecrets": [{ "name": &cfg.registry_secret_name }]
+    });
+    sa_api
+        .patch("default", &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .context("patching default service account")?;
+    Ok(())
 }
 
 fn read_remote_file(

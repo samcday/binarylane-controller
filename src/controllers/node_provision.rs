@@ -1,9 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result as AnyResult};
 use binarylane_client as binarylane;
 use k8s_openapi::api::core::v1::{Event, EventSource, Node, ObjectReference, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
-use kube::Api;
 use kube::api::PatchParams;
+use kube::runtime::controller::Action;
+use kube::{Api, ResourceExt};
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use super::{
@@ -27,211 +29,172 @@ fn config_hash(labels: Option<&std::collections::BTreeMap<String, String>>) -> S
         .join("|")
 }
 
-pub async fn reconcile(ctx: &ReconcileContext) {
-    let nodes_api: Api<Node> = Api::all(ctx.k8s.clone());
-    let nodes = match nodes_api.list(&Default::default()).await {
-        Ok(list) => list,
-        Err(e) => {
-            error!(error = %e, "node-provision: listing nodes");
-            return;
-        }
-    };
+pub async fn reconcile(
+    node: Arc<Node>,
+    ctx: Arc<ReconcileContext>,
+) -> std::result::Result<Action, super::Error> {
+    let name = node.name_any();
+    let node_uid = node.metadata.uid.clone();
+    let labels = node.metadata.labels.as_ref();
 
-    let sizes = match ctx.bl.list_sizes().await {
-        Ok(s) => s,
-        Err(e) => {
-            error!(error = %e, "node-provision: listing sizes");
-            return;
-        }
-    };
-    let regions = match ctx.bl.list_regions().await {
-        Ok(r) => r,
-        Err(e) => {
-            error!(error = %e, "node-provision: listing regions");
-            return;
-        }
-    };
-    let images = match ctx.bl.list_images().await {
-        Ok(i) => i,
-        Err(e) => {
-            error!(error = %e, "node-provision: listing images");
-            return;
-        }
-    };
-
-    for node in &nodes {
-        let Some(name) = node.metadata.name.as_deref() else {
-            continue;
-        };
-        let node_uid = node.metadata.uid.clone();
-        let labels = node.metadata.labels.as_ref();
-
-        // Skip nodes already bound to a server.
-        if labels.is_some_and(|l| l.contains_key(LABEL_SERVER_ID)) {
-            continue;
-        }
-
-        // Skip nodes being deleted.
-        if node.metadata.deletion_timestamp.is_some() {
-            continue;
-        }
-
-        // Skip nodes with none of the provision labels.
-        let has_any = labels.is_some_and(|l| {
-            l.contains_key(LABEL_SIZE)
-                || l.contains_key(LABEL_REGION)
-                || l.contains_key(LABEL_IMAGE)
-        });
-        if !has_any {
-            continue;
-        }
-
-        // Skip nodes whose config we've already validated and rejected.
-        let hash = config_hash(labels);
-        let already_failed = node
-            .metadata
-            .annotations
-            .as_ref()
-            .and_then(|a| a.get(ANNOTATION_PROVISION_FAILED))
-            .is_some_and(|v| *v == hash);
-        if already_failed {
-            continue;
-        }
-
-        let size = labels.and_then(|l| l.get(LABEL_SIZE));
-        let region = labels.and_then(|l| l.get(LABEL_REGION));
-        let image = labels.and_then(|l| l.get(LABEL_IMAGE));
-
-        // Validate all three required labels are present.
-        let mut missing = Vec::new();
-        if size.is_none() {
-            missing.push(LABEL_SIZE);
-        }
-        if region.is_none() {
-            missing.push(LABEL_REGION);
-        }
-        if image.is_none() {
-            missing.push(LABEL_IMAGE);
-        }
-        if !missing.is_empty() {
-            let msg = format!("missing required labels: {}", missing.join(", "));
-            set_provision_failed(
-                &nodes_api,
-                &ctx.k8s,
-                name,
-                node_uid,
-                &hash,
-                "InvalidConfig",
-                &msg,
-            )
-            .await;
-            continue;
-        }
-
-        let size = size.unwrap();
-        let region = region.unwrap();
-        let image = image.unwrap();
-
-        // Validate size slug.
-        if !sizes.iter().any(|s| s.slug == *size) {
-            let msg = format!(
-                "unknown size '{}' (available: {})",
-                size,
-                sizes
-                    .iter()
-                    .map(|s| s.slug.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            set_provision_failed(
-                &nodes_api,
-                &ctx.k8s,
-                name,
-                node_uid,
-                &hash,
-                "InvalidConfig",
-                &msg,
-            )
-            .await;
-            continue;
-        }
-
-        // Validate region slug.
-        if !regions.iter().any(|r| r.slug == *region) {
-            let msg = format!(
-                "unknown region '{}' (available: {})",
-                region,
-                regions
-                    .iter()
-                    .map(|r| r.slug.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            set_provision_failed(
-                &nodes_api,
-                &ctx.k8s,
-                name,
-                node_uid,
-                &hash,
-                "InvalidConfig",
-                &msg,
-            )
-            .await;
-            continue;
-        }
-
-        // Validate image slug.
-        if !images
-            .iter()
-            .any(|i| i.slug.as_deref() == Some(image.as_str()))
-        {
-            let msg = format!(
-                "unknown image '{}' (available: {})",
-                image,
-                images
-                    .iter()
-                    .filter_map(|i| i.slug.as_deref())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            set_provision_failed(
-                &nodes_api,
-                &ctx.k8s,
-                name,
-                node_uid,
-                &hash,
-                "InvalidConfig",
-                &msg,
-            )
-            .await;
-            continue;
-        }
-
-        match provision_node(
-            ctx,
-            &nodes_api,
-            name,
-            size.clone(),
-            region.clone(),
-            image.clone(),
-            node_uid.clone(),
-        )
-        .await
-        {
-            Ok(()) => {
-                // Clear the failed annotation and condition if they were set
-                // from a previous attempt (e.g. transient API error).
-                clear_provision_failed(&nodes_api, name).await;
-            }
-            Err(e) => {
-                // Don't set the failed-config annotation — transient errors
-                // (API timeouts, rate limits) should be retried on next cycle.
-                let msg = format!("server creation failed: {e:#}");
-                error!(error = %e, node = name, "node-provision: provisioning failed");
-                emit_event(&ctx.k8s, name, node_uid, "Warning", "ProvisionError", &msg).await;
-            }
-        }
+    if labels.is_some_and(|l| l.contains_key(LABEL_SERVER_ID)) {
+        return Ok(Action::await_change());
     }
+
+    if node.metadata.deletion_timestamp.is_some() {
+        return Ok(Action::await_change());
+    }
+
+    let has_any = labels.is_some_and(|l| {
+        l.contains_key(LABEL_SIZE) || l.contains_key(LABEL_REGION) || l.contains_key(LABEL_IMAGE)
+    });
+    if !has_any {
+        return Ok(Action::await_change());
+    }
+
+    let hash = config_hash(labels);
+    let already_failed = node
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(ANNOTATION_PROVISION_FAILED))
+        .is_some_and(|v| *v == hash);
+    if already_failed {
+        return Ok(Action::await_change());
+    }
+
+    let nodes_api: Api<Node> = Api::all(ctx.k8s.clone());
+
+    let size = labels.and_then(|l| l.get(LABEL_SIZE));
+    let region = labels.and_then(|l| l.get(LABEL_REGION));
+    let image = labels.and_then(|l| l.get(LABEL_IMAGE));
+
+    let mut missing = Vec::new();
+    if size.is_none() {
+        missing.push(LABEL_SIZE);
+    }
+    if region.is_none() {
+        missing.push(LABEL_REGION);
+    }
+    if image.is_none() {
+        missing.push(LABEL_IMAGE);
+    }
+    if !missing.is_empty() {
+        let msg = format!("missing required labels: {}", missing.join(", "));
+        set_provision_failed(
+            &nodes_api,
+            &ctx.k8s,
+            &name,
+            node_uid,
+            &hash,
+            "InvalidConfig",
+            &msg,
+        )
+        .await;
+        return Ok(Action::await_change());
+    }
+
+    let size = size.cloned().unwrap_or_default();
+    let region = region.cloned().unwrap_or_default();
+    let image = image.cloned().unwrap_or_default();
+
+    let catalog = ctx.bl_catalog().await?;
+
+    if !catalog.sizes.iter().any(|s| s.slug == size) {
+        let msg = format!(
+            "unknown size '{}' (available: {})",
+            size,
+            catalog
+                .sizes
+                .iter()
+                .map(|s| s.slug.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        set_provision_failed(
+            &nodes_api,
+            &ctx.k8s,
+            &name,
+            node_uid,
+            &hash,
+            "InvalidConfig",
+            &msg,
+        )
+        .await;
+        return Ok(Action::await_change());
+    }
+
+    if !catalog.regions.iter().any(|r| r.slug == region) {
+        let msg = format!(
+            "unknown region '{}' (available: {})",
+            region,
+            catalog
+                .regions
+                .iter()
+                .map(|r| r.slug.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        set_provision_failed(
+            &nodes_api,
+            &ctx.k8s,
+            &name,
+            node_uid,
+            &hash,
+            "InvalidConfig",
+            &msg,
+        )
+        .await;
+        return Ok(Action::await_change());
+    }
+
+    if !catalog
+        .images
+        .iter()
+        .any(|i| i.slug.as_deref() == Some(image.as_str()))
+    {
+        let msg = format!(
+            "unknown image '{}' (available: {})",
+            image,
+            catalog
+                .images
+                .iter()
+                .filter_map(|i| i.slug.as_deref())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        set_provision_failed(
+            &nodes_api,
+            &ctx.k8s,
+            &name,
+            node_uid,
+            &hash,
+            "InvalidConfig",
+            &msg,
+        )
+        .await;
+        return Ok(Action::await_change());
+    }
+
+    if let Err(e) = provision_node(
+        &ctx,
+        &nodes_api,
+        &name,
+        size,
+        region,
+        image,
+        node_uid.clone(),
+    )
+    .await
+    {
+        let msg = format!("server creation failed: {e:#}");
+        error!(error = format_args!("{e:#}"), node = %name, "node-provision: provisioning failed");
+        emit_event(&ctx.k8s, &name, node_uid, "Warning", "ProvisionError", &msg).await;
+        return Err(e.into());
+    }
+
+    clear_provision_failed(&nodes_api, &name).await;
+    Ok(Action::await_change())
 }
 
 async fn set_provision_failed(
@@ -339,7 +302,7 @@ async fn provision_node(
     region: String,
     image: String,
     node_uid: Option<String>,
-) -> Result<()> {
+) -> AnyResult<()> {
     let secrets_api: Api<Secret> = Api::namespaced(ctx.k8s.clone(), &ctx.secret_namespace);
 
     // Ensure finalizer is present before creating any external resources.

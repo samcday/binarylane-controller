@@ -5,8 +5,13 @@ pub mod node_sync;
 pub mod service;
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
 
 use binarylane_client as binarylane;
+use k8s_openapi::api::core::v1::{Node, Secret};
+use kube::runtime::controller::Action;
+use kube::runtime::reflector::ObjectRef;
 
 pub const FINALIZER: &str = "blc.samcday.com/server-cleanup";
 pub const UNINITIALIZED_TAINT: &str = "node.cloudprovider.kubernetes.io/uninitialized";
@@ -32,6 +37,91 @@ pub struct ReconcileContext {
     pub bl: binarylane::Client,
     pub k8s: kube::Client,
     pub secret_namespace: String,
+    pub bl_catalog: tokio::sync::RwLock<Option<BlCatalog>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("kube: {0}")]
+    Kube(#[from] kube::Error),
+    #[error("{0}")]
+    Other(#[from] anyhow::Error),
+}
+
+pub fn error_policy<T: kube::Resource>(
+    _obj: Arc<T>,
+    _err: &Error,
+    _ctx: Arc<ReconcileContext>,
+) -> Action {
+    Action::requeue(Duration::from_secs(30))
+}
+
+pub fn secret_to_node_mapper(secret: Secret) -> Option<ObjectRef<Node>> {
+    let name = secret.metadata.name.as_deref()?;
+    let node_name = name
+        .strip_suffix("-node-password")
+        .or_else(|| name.strip_suffix("-user-data"))?;
+    Some(ObjectRef::<Node>::new(node_name))
+}
+
+pub struct BlCatalog {
+    pub sizes: Vec<binarylane::ListedSize>,
+    pub regions: Vec<binarylane::ListedRegion>,
+    pub images: Vec<binarylane::ListedImage>,
+    pub fetched_at: std::time::Instant,
+}
+
+pub struct BlCatalogSnapshot {
+    pub sizes: Vec<binarylane::ListedSize>,
+    pub regions: Vec<binarylane::ListedRegion>,
+    pub images: Vec<binarylane::ListedImage>,
+}
+
+impl ReconcileContext {
+    pub async fn bl_catalog(&self) -> std::result::Result<BlCatalogSnapshot, Error> {
+        {
+            let guard = self.bl_catalog.read().await;
+            if let Some(ref cat) = *guard
+                && cat.fetched_at.elapsed() < Duration::from_secs(300)
+            {
+                return Ok(BlCatalogSnapshot {
+                    sizes: cat.sizes.clone(),
+                    regions: cat.regions.clone(),
+                    images: cat.images.clone(),
+                });
+            }
+        }
+
+        // Take write lock to serialize refreshes — re-check in case another
+        // task already refreshed while we were waiting for the lock.
+        let mut guard = self.bl_catalog.write().await;
+        if let Some(ref cat) = *guard
+            && cat.fetched_at.elapsed() < Duration::from_secs(300)
+        {
+            return Ok(BlCatalogSnapshot {
+                sizes: cat.sizes.clone(),
+                regions: cat.regions.clone(),
+                images: cat.images.clone(),
+            });
+        }
+
+        let sizes = self.bl.list_sizes().await?;
+        let regions = self.bl.list_regions().await?;
+        let images = self.bl.list_images().await?;
+
+        *guard = Some(BlCatalog {
+            sizes: sizes.clone(),
+            regions: regions.clone(),
+            images: images.clone(),
+            fetched_at: std::time::Instant::now(),
+        });
+
+        Ok(BlCatalogSnapshot {
+            sizes,
+            regions,
+            images,
+        })
+    }
 }
 
 /// Default-enabled controllers.
@@ -114,5 +204,25 @@ mod tests {
         assert_eq!(set.len(), 2);
         assert!(set.contains("node-sync"));
         assert!(set.contains("node-bind"));
+    }
+
+    #[test]
+    fn test_secret_to_node_mapper() {
+        let make_secret = |name: &str| Secret {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let ref_ = secret_to_node_mapper(make_secret("worker-1-node-password")).unwrap();
+        assert_eq!(ref_.name, "worker-1");
+
+        let ref_ = secret_to_node_mapper(make_secret("worker-1-user-data")).unwrap();
+        assert_eq!(ref_.name, "worker-1");
+
+        assert!(secret_to_node_mapper(make_secret("unrelated-secret")).is_none());
+        assert!(secret_to_node_mapper(make_secret("node-password")).is_none());
     }
 }

@@ -1,8 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result as AnyResult};
 use binarylane_client as binarylane;
 use k8s_openapi::api::core::v1::{Node, Service};
+use kube::ResourceExt;
 use kube::api::PatchParams;
+use kube::runtime::controller::Action;
 use kube::{Api, Client as KubeClient};
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 use super::ReconcileContext;
@@ -11,30 +15,33 @@ const ANNOTATION_LB_ID: &str = "binarylane.com.au/load-balancer-id";
 const ANNOTATION_LB_REGION: &str = "binarylane.com.au/load-balancer-region";
 const FINALIZER: &str = "binarylane.com.au/load-balancer";
 
-pub async fn reconcile(ctx: &ReconcileContext) {
-    let svc_api: Api<Service> = Api::all(ctx.k8s.clone());
-    let services = match svc_api.list(&Default::default()).await {
-        Ok(list) => list,
-        Err(e) => {
-            error!(error = %e, "listing services");
-            return;
+pub async fn reconcile(
+    svc: Arc<Service>,
+    ctx: Arc<ReconcileContext>,
+) -> std::result::Result<Action, super::Error> {
+    let spec = match svc.spec.as_ref() {
+        Some(s) => s,
+        None => return Ok(Action::await_change()),
+    };
+    if spec.type_.as_deref() != Some("LoadBalancer") {
+        return Ok(Action::await_change());
+    }
+
+    let ns = match svc.metadata.namespace.as_deref() {
+        Some(ns) => ns,
+        None => {
+            warn!(service = %svc.name_any(), "service missing namespace, skipping");
+            return Ok(Action::await_change());
         }
     };
+    let name = svc.name_any();
 
-    for svc in &services {
-        let spec = match svc.spec.as_ref() {
-            Some(s) => s,
-            None => continue,
-        };
-        if spec.type_.as_deref() != Some("LoadBalancer") {
-            continue;
-        }
-        let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-        let name = svc.metadata.name.as_deref().unwrap_or("");
-        if let Err(e) = reconcile_service(&ctx.bl, &ctx.k8s, svc, ns, name).await {
-            error!(error = %e, service = %format!("{ns}/{name}"), "reconciling service");
-        }
+    if let Err(e) = reconcile_service(&ctx.bl, &ctx.k8s, &svc, ns, &name).await {
+        error!(error = format_args!("{e:#}"), service = %format!("{ns}/{name}"), "reconciling service");
+        return Err(e.into());
     }
+
+    Ok(Action::requeue(Duration::from_secs(60)))
 }
 
 async fn reconcile_service(
@@ -43,7 +50,7 @@ async fn reconcile_service(
     svc: &Service,
     ns: &str,
     name: &str,
-) -> Result<()> {
+) -> AnyResult<()> {
     let svc_api: Api<Service> = Api::namespaced(k8s.clone(), ns);
 
     // Handle deletion
@@ -191,7 +198,7 @@ async fn create_load_balancer(
     rules: Vec<binarylane::ForwardingRule>,
     health_check: binarylane::HealthCheck,
     node_ids: Vec<i64>,
-) -> Result<()> {
+) -> AnyResult<()> {
     info!(service = %format!("{ns}/{name}"), region, "creating load balancer");
     let lb = bl
         .create_load_balancer(binarylane::CreateLoadBalancerRequest {
@@ -227,7 +234,7 @@ async fn update_service_status(
     svc_api: &Api<Service>,
     name: &str,
     lb: &binarylane::LoadBalancer,
-) -> Result<()> {
+) -> AnyResult<()> {
     if lb.ip.is_empty() {
         return Ok(());
     }
@@ -256,7 +263,7 @@ async fn handle_deletion(
     svc: &Service,
     ns: &str,
     name: &str,
-) -> Result<()> {
+) -> AnyResult<()> {
     let has_finalizer = svc
         .metadata
         .finalizers
@@ -304,7 +311,7 @@ async fn handle_deletion(
     Ok(())
 }
 
-async fn get_ready_node_server_ids(k8s: &KubeClient) -> Result<Vec<i64>> {
+async fn get_ready_node_server_ids(k8s: &KubeClient) -> AnyResult<Vec<i64>> {
     let nodes_api: Api<Node> = Api::all(k8s.clone());
     let nodes = nodes_api
         .list(&Default::default())

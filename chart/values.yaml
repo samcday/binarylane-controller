@@ -73,5 +73,7 @@ tolerations:
     operator: Exists
 affinity: {}
 
+extraEnv: []
+
 podAnnotations: {}
 podLabels: {}

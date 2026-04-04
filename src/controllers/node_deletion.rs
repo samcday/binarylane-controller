@@ -1,65 +1,59 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result as AnyResult};
 use binarylane_client as binarylane;
 use k8s_openapi::api::core::v1::{Node, Secret};
-use kube::Api;
 use kube::api::PatchParams;
+use kube::runtime::controller::Action;
+use kube::{Api, ResourceExt};
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info};
 
 use super::{FINALIZER, ReconcileContext, node_password_secret_name, user_data_secret_name};
 
-pub async fn reconcile(ctx: &ReconcileContext) {
-    let nodes_api: Api<Node> = Api::all(ctx.k8s.clone());
-    let secrets_api: Api<Secret> = Api::namespaced(ctx.k8s.clone(), &ctx.secret_namespace);
-    let nodes = match nodes_api.list(&Default::default()).await {
-        Ok(list) => list,
-        Err(e) => {
-            error!(error = %e, "node-deletion: listing nodes");
-            return;
-        }
-    };
+pub async fn reconcile(
+    node: Arc<Node>,
+    ctx: Arc<ReconcileContext>,
+) -> std::result::Result<Action, super::Error> {
+    let name = node.name_any();
+    let provider_id = node
+        .spec
+        .as_ref()
+        .and_then(|s| s.provider_id.as_deref())
+        .unwrap_or("");
+    let server_id = binarylane::parse_provider_id(provider_id);
 
-    for node in &nodes {
-        let Some(name) = node.metadata.name.as_deref() else {
-            continue;
-        };
-        let provider_id = node
-            .spec
-            .as_ref()
-            .and_then(|s| s.provider_id.as_deref())
-            .unwrap_or("");
-        let server_id = binarylane::parse_provider_id(provider_id);
+    let has_finalizer = node
+        .metadata
+        .finalizers
+        .as_ref()
+        .is_some_and(|f| f.iter().any(|f| f == FINALIZER));
+    let has_provision_labels = node.metadata.labels.as_ref().is_some_and(|l| {
+        l.contains_key(super::LABEL_SIZE)
+            || l.contains_key(super::LABEL_REGION)
+            || l.contains_key(super::LABEL_IMAGE)
+    });
 
-        let has_finalizer = node
-            .metadata
-            .finalizers
-            .as_ref()
-            .is_some_and(|f| f.iter().any(|f| f == FINALIZER));
-
-        // Process nodes that either have a BL provider ID, have our finalizer,
-        // or are provision candidates.
-        let has_provision_labels = node.metadata.labels.as_ref().is_some_and(|l| {
-            l.contains_key(super::LABEL_SIZE)
-                || l.contains_key(super::LABEL_REGION)
-                || l.contains_key(super::LABEL_IMAGE)
-        });
-        if server_id.is_none() && !has_finalizer && !has_provision_labels {
-            continue;
-        }
-
-        if let Err(e) = reconcile_node(ctx, &nodes_api, &secrets_api, node, name, server_id).await {
-            error!(error = %e, node = name, ?server_id, "node-deletion: reconciling node");
-        }
+    if server_id.is_none() && !has_finalizer && !has_provision_labels {
+        return Ok(Action::await_change());
     }
+
+    if let Err(e) = reconcile_node(&ctx, &node, &name, server_id).await {
+        error!(error = %e, node = %name, ?server_id, "node-deletion: reconciling node");
+        return Err(e.into());
+    }
+
+    Ok(Action::requeue(Duration::from_secs(300)))
 }
 
 async fn reconcile_node(
     ctx: &ReconcileContext,
-    nodes_api: &Api<Node>,
-    secrets_api: &Api<Secret>,
     node: &Node,
     name: &str,
     server_id: Option<i64>,
-) -> Result<()> {
+) -> AnyResult<()> {
+    let nodes_api: Api<Node> = Api::all(ctx.k8s.clone());
+    let secrets_api: Api<Secret> = Api::namespaced(ctx.k8s.clone(), &ctx.secret_namespace);
+
     let has_finalizer = node
         .metadata
         .finalizers
@@ -78,8 +72,8 @@ async fn reconcile_node(
             ctx.bl.delete_server(sid).await.context("deleting server")?;
         }
 
-        delete_secret_if_exists(secrets_api, &node_password_secret_name(name)).await?;
-        delete_secret_if_exists(secrets_api, &user_data_secret_name(name)).await?;
+        delete_secret_if_exists(&secrets_api, &node_password_secret_name(name)).await?;
+        delete_secret_if_exists(&secrets_api, &user_data_secret_name(name)).await?;
 
         let patch = serde_json::json!({
             "metadata": {
@@ -108,8 +102,8 @@ async fn reconcile_node(
                 server_id = sid,
                 "server deleted, removing node"
             );
-            delete_secret_if_exists(secrets_api, &node_password_secret_name(name)).await?;
-            delete_secret_if_exists(secrets_api, &user_data_secret_name(name)).await?;
+            delete_secret_if_exists(&secrets_api, &node_password_secret_name(name)).await?;
+            delete_secret_if_exists(&secrets_api, &user_data_secret_name(name)).await?;
             nodes_api
                 .delete(name, &Default::default())
                 .await
@@ -149,19 +143,19 @@ async fn reconcile_node(
     // before the node exists, so we set the ownerRef here on first reconciliation).
     if let Some(node_uid) = &node.metadata.uid {
         tether_secret_to_node(
-            secrets_api,
+            &secrets_api,
             &node_password_secret_name(name),
             name,
             node_uid,
         )
         .await;
-        tether_secret_to_node(secrets_api, &user_data_secret_name(name), name, node_uid).await;
+        tether_secret_to_node(&secrets_api, &user_data_secret_name(name), name, node_uid).await;
     }
 
     Ok(())
 }
 
-async fn delete_secret_if_exists(secrets_api: &Api<Secret>, name: &str) -> Result<()> {
+async fn delete_secret_if_exists(secrets_api: &Api<Secret>, name: &str) -> AnyResult<()> {
     match secrets_api.delete(name, &Default::default()).await {
         Ok(_) => {
             info!(secret = name, "deleted secret");

@@ -57,20 +57,28 @@ _ed_client_key = str(read_file(".dev/mtls-external-dns-client.key")).strip()
 # Deploy via Helm chart. mTLS is enabled so the deployment gets TLS env vars
 # and volume mounts, but we override the helm-generated cert secrets below
 # with our stable dev certs.
+_cloud_init = str(read_file("dev-cloud-init.sh")).strip()
+_helm_set = [
+    "apiToken=" + binarylane_api_token,
+    "image.repository=" + registry_image,
+    "image.tag=latest",
+    "image.pullPolicy=Always",
+    "imagePullSecrets[0].name=" + registry_pull_secret,
+    "autoscaler.cloudInit=" + _cloud_init,
+    # Skip Helm cert generation — we manage mTLS secrets ourselves above.
+    # mtls.enabled stays true so the deployment gets TLS env vars + volume mounts.
+    "mtls.generate=false",
+]
+_rust_log = os.getenv("RUST_LOG", "")
+if _rust_log:
+    _helm_set.append("extraEnv[0].name=RUST_LOG")
+    _helm_set.append("extraEnv[0].value=" + _rust_log)
+
 controller_manifests = helm(
     "chart",
     name="binarylane-controller",
     namespace="binarylane-system",
-    set=[
-        "apiToken=" + binarylane_api_token,
-        "image.repository=" + registry_image,
-        "image.tag=latest",
-        "image.pullPolicy=Always",
-        "imagePullSecrets[0].name=" + registry_pull_secret,
-        # Skip Helm cert generation — we manage mTLS secrets ourselves above.
-        # mtls.enabled stays true so the deployment gets TLS env vars + volume mounts.
-        "mtls.generate=false",
-    ],
+    set=_helm_set,
     values=["tilt-values.yaml", generated_values],
 )
 k8s_yaml(controller_manifests)

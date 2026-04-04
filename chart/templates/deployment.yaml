@@ -71,6 +71,9 @@ spec:
             - name: TLS_CA_PATH
               value: /etc/binarylane-controller/tls/ca.crt
             {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- if or .Values.autoscaler.enabled .Values.externalDns.enabled }}
           ports:
             {{- if .Values.autoscaler.enabled }}

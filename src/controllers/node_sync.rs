@@ -1,52 +1,52 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result as AnyResult};
 use binarylane_client as binarylane;
 use k8s_openapi::api::core::v1::Node;
-use kube::Api;
 use kube::api::PatchParams;
+use kube::runtime::controller::Action;
+use kube::{Api, ResourceExt};
 use tracing::{error, info};
 
 use super::{ReconcileContext, UNINITIALIZED_TAINT};
 
-pub async fn reconcile(ctx: &ReconcileContext) {
-    let nodes_api: Api<Node> = Api::all(ctx.k8s.clone());
-    let nodes = match nodes_api.list(&Default::default()).await {
-        Ok(list) => list,
-        Err(e) => {
-            error!(error = %e, "node-sync: listing nodes");
-            return;
-        }
+pub async fn reconcile(
+    node: Arc<Node>,
+    ctx: Arc<ReconcileContext>,
+) -> std::result::Result<Action, super::Error> {
+    let name = node.name_any();
+
+    if node.metadata.deletion_timestamp.is_some() {
+        return Ok(Action::await_change());
+    }
+
+    let provider_id = node
+        .spec
+        .as_ref()
+        .and_then(|s| s.provider_id.as_deref())
+        .unwrap_or("");
+    let Some(server_id) = binarylane::parse_provider_id(provider_id) else {
+        return Ok(Action::await_change());
     };
 
-    for node in &nodes {
-        let Some(name) = node.metadata.name.as_deref() else {
-            continue;
-        };
-        if node.metadata.deletion_timestamp.is_some() {
-            continue;
-        }
-        let provider_id = node
-            .spec
-            .as_ref()
-            .and_then(|s| s.provider_id.as_deref())
-            .unwrap_or("");
-        let Some(server_id) = binarylane::parse_provider_id(provider_id) else {
-            continue;
-        };
-        if let Err(e) = reconcile_node(ctx, &nodes_api, node, name, server_id).await {
-            error!(error = %e, node = name, server_id, "node-sync: reconciling node");
-        }
+    if let Err(e) = reconcile_node(&ctx, &node, &name, server_id).await {
+        error!(error = format_args!("{e:#}"), node = %name, server_id, "node-sync: reconciling node");
+        return Err(e.into());
     }
+
+    Ok(Action::requeue(Duration::from_secs(300)))
 }
 
 async fn reconcile_node(
     ctx: &ReconcileContext,
-    nodes_api: &Api<Node>,
     node: &Node,
     name: &str,
     server_id: i64,
-) -> Result<()> {
+) -> AnyResult<()> {
+    let nodes_api: Api<Node> = Api::all(ctx.k8s.clone());
+
     let server = ctx
         .bl
         .get_server(server_id)

@@ -266,6 +266,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tonic",
@@ -3343,10 +3344,13 @@ dependencies = [
  "bcrypt",
  "binarylane-client",
  "clap",
+ "k8s-openapi",
+ "kube",
  "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

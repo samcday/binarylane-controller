@@ -8,11 +8,12 @@ pub mod proto {
     tonic::include_proto!("clusterautoscaler.cloudprovider.v1.externalgrpc");
 }
 
-use std::time::Duration;
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::StreamExt;
+use k8s_openapi::api::core::v1::{Node, Secret, Service};
+use kube::Api;
+use kube::runtime::{Controller, watcher};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::{error, info, warn};
 
@@ -61,6 +62,29 @@ struct Args {
     controllers: String,
 }
 
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to install SIGTERM handler; waiting for SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -81,6 +105,7 @@ async fn main() -> Result<()> {
         bl: bl.clone(),
         k8s: k8s.clone(),
         secret_namespace: args.pod_namespace.clone(),
+        bl_catalog: tokio::sync::RwLock::new(None),
     });
 
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -88,72 +113,142 @@ async fn main() -> Result<()> {
     if enabled.contains("node-sync") {
         let ctx = ctx.clone();
         handles.push(tokio::spawn(async move {
-            info!(interval = ?Duration::from_secs(30), "node-sync controller starting");
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                controllers::node_sync::reconcile(&ctx).await;
-            }
+            info!("node-sync controller starting");
+            let nodes: Api<Node> = Api::all(ctx.k8s.clone());
+            Controller::new(nodes, watcher::Config::default())
+                .shutdown_on_signal()
+                .run(
+                    controllers::node_sync::reconcile,
+                    controllers::error_policy,
+                    ctx,
+                )
+                .for_each(|res| async move {
+                    match res {
+                        Ok((obj, _)) => tracing::trace!(name = %obj.name, "node-sync: reconciled"),
+                        Err(e) => tracing::warn!(error = %e, "node-sync: reconcile failed"),
+                    }
+                })
+                .await;
         }));
     }
 
     if enabled.contains("node-deletion") {
         let ctx = ctx.clone();
         handles.push(tokio::spawn(async move {
-            info!(interval = ?Duration::from_secs(30), "node-deletion controller starting");
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                controllers::node_deletion::reconcile(&ctx).await;
-            }
+            info!("node-deletion controller starting");
+            let nodes: Api<Node> = Api::all(ctx.k8s.clone());
+            let secrets: Api<Secret> = Api::namespaced(ctx.k8s.clone(), &ctx.secret_namespace);
+            Controller::new(nodes, watcher::Config::default())
+                .watches(
+                    secrets,
+                    watcher::Config::default(),
+                    controllers::secret_to_node_mapper,
+                )
+                .shutdown_on_signal()
+                .run(
+                    controllers::node_deletion::reconcile,
+                    controllers::error_policy,
+                    ctx,
+                )
+                .for_each(|res| async move {
+                    match res {
+                        Ok((obj, _)) => {
+                            tracing::trace!(name = %obj.name, "node-deletion: reconciled")
+                        }
+                        Err(e) => tracing::warn!(error = %e, "node-deletion: reconcile failed"),
+                    }
+                })
+                .await;
         }));
     }
 
     if enabled.contains("node-bind") {
         let ctx = ctx.clone();
         handles.push(tokio::spawn(async move {
-            info!(interval = ?Duration::from_secs(30), "node-bind controller starting");
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                controllers::node_bind::reconcile(&ctx).await;
-            }
+            info!("node-bind controller starting");
+            let nodes: Api<Node> = Api::all(ctx.k8s.clone());
+            Controller::new(nodes, watcher::Config::default())
+                .shutdown_on_signal()
+                .run(
+                    controllers::node_bind::reconcile,
+                    controllers::error_policy,
+                    ctx,
+                )
+                .for_each(|res| async move {
+                    match res {
+                        Ok((obj, _)) => tracing::trace!(name = %obj.name, "node-bind: reconciled"),
+                        Err(e) => tracing::warn!(error = %e, "node-bind: reconcile failed"),
+                    }
+                })
+                .await;
         }));
     }
 
     if enabled.contains("node-provision") {
         let ctx = ctx.clone();
         handles.push(tokio::spawn(async move {
-            info!(interval = ?Duration::from_secs(30), "node-provision controller starting");
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                controllers::node_provision::reconcile(&ctx).await;
-            }
+            info!("node-provision controller starting");
+            let nodes: Api<Node> = Api::all(ctx.k8s.clone());
+            let secrets: Api<Secret> = Api::namespaced(ctx.k8s.clone(), &ctx.secret_namespace);
+            Controller::new(nodes, watcher::Config::default())
+                .watches(
+                    secrets,
+                    watcher::Config::default(),
+                    controllers::secret_to_node_mapper,
+                )
+                .shutdown_on_signal()
+                .run(
+                    controllers::node_provision::reconcile,
+                    controllers::error_policy,
+                    ctx,
+                )
+                .for_each(|res| async move {
+                    match res {
+                        Ok((obj, _)) => {
+                            tracing::trace!(name = %obj.name, "node-provision: reconciled")
+                        }
+                        Err(e) => tracing::warn!(error = %e, "node-provision: reconcile failed"),
+                    }
+                })
+                .await;
         }));
     }
 
     if enabled.contains("service") {
         let ctx = ctx.clone();
         handles.push(tokio::spawn(async move {
-            info!(interval = ?Duration::from_secs(30), "service controller starting");
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                controllers::service::reconcile(&ctx).await;
-            }
+            info!("service controller starting");
+            let services: Api<Service> = Api::all(ctx.k8s.clone());
+            Controller::new(services, watcher::Config::default())
+                .shutdown_on_signal()
+                .run(
+                    controllers::service::reconcile,
+                    controllers::error_policy,
+                    ctx,
+                )
+                .for_each(|res| async move {
+                    match res {
+                        Ok((obj, _)) => tracing::trace!(name = %obj.name, "service: reconciled"),
+                        Err(e) => tracing::warn!(error = %e, "service: reconcile failed"),
+                    }
+                })
+                .await;
         }));
     }
 
-    // Monitor controller tasks - exit if any die
+    // Monitor controller tasks — exit if any panic. Clean exits (e.g. from
+    // shutdown_on_signal) are expected and ignored.
     if !handles.is_empty() {
+        info!(count = handles.len(), "controllers started");
         tokio::spawn(async move {
             let (result, _index, _remaining) = futures::future::select_all(handles).await;
             match result {
-                Ok(_) => error!("controller exited unexpectedly"),
-                Err(e) => error!(error = %e, "controller panicked"),
+                Ok(_) => {}
+                Err(e) => {
+                    error!(error = %e, "controller panicked");
+                    std::process::exit(1);
+                }
             }
-            std::process::exit(1);
         });
     }
 
@@ -203,7 +298,8 @@ async fn main() -> Result<()> {
     }
 
     if !args.cluster_autoscaler_service {
-        std::future::pending::<()>().await;
+        shutdown_signal().await;
+        info!("shutdown signal received");
         return Ok(());
     }
 
@@ -253,7 +349,10 @@ async fn main() -> Result<()> {
 
     server
         .add_service(svc)
-        .serve(addr)
+        .serve_with_shutdown(addr, async {
+            shutdown_signal().await;
+            info!("shutdown signal received");
+        })
         .await
         .context("gRPC server error")?;
 
