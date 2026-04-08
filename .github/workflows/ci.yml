@@ -2,6 +2,10 @@ name: CI
 
 on:
   workflow_call:
+    inputs:
+      force:
+        type: boolean
+        default: false
   push:
     branches: [main]
   pull_request:
@@ -19,7 +23,7 @@ permissions:
 
 jobs:
   check:
-    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release/v')
+    if: inputs.force || github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release/v')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
