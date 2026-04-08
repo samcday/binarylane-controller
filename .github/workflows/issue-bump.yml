@@ -41,6 +41,14 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install Rust toolchain
+        if: steps.parse.outputs.skip != 'true'
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install protoc
+        if: steps.parse.outputs.skip != 'true'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Configure git
         if: steps.parse.outputs.skip != 'true'
         run: |
@@ -64,7 +72,7 @@ jobs:
           fi
 
           git checkout -B "$branch" "origin/$base"
-          bash scripts/bump-version.sh "$version"
+          cargo xtask bump "$version"
 
           if git diff --quiet; then
             echo "No version file changes for $version; creating empty bootstrap commit"
@@ -98,7 +106,7 @@ jobs:
           fi
 
           git checkout -B "$branch" "origin/$base"
-          bash scripts/bump-version.sh "$version"
+          cargo xtask bump "$version"
 
           if git diff --quiet; then
             echo "No version changes for $version; skipping"

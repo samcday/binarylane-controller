@@ -103,6 +103,14 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
 
+      - name: Install Rust toolchain
+        if: steps.parse.outputs.skip != 'true'
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install protoc
+        if: steps.parse.outputs.skip != 'true'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Create next rc PR
         if: steps.parse.outputs.skip != 'true'
         env:
@@ -122,7 +130,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git checkout -b "$branch"
-          bash scripts/bump-version.sh "$version"
+          cargo xtask bump "$version"
 
           if git diff --quiet; then
             echo "No version changes for $version; skipping"

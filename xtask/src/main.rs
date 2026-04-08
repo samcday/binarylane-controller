@@ -54,6 +54,11 @@ enum Commands {
     DevDown(DevDownArgs),
     /// Launch Tilt with project-appropriate defaults (--port 0 to avoid collisions)
     Tilt(TiltArgs),
+    /// Bump version in Cargo.toml, chart/Chart.yaml, and Cargo.lock
+    Bump {
+        /// Version string (e.g. 1.2.3 or 1.2.3-rc.1)
+        version: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -249,7 +254,71 @@ fn main() -> Result<()> {
         Commands::DevUp(args) => cmd_dev_up(*args),
         Commands::DevDown(args) => cmd_dev_down(args),
         Commands::Tilt(args) => cmd_tilt(args),
+        Commands::Bump { version } => cmd_bump(&version),
     }
+}
+
+fn cmd_bump(version: &str) -> Result<()> {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let cargo_toml = workspace_root.join("Cargo.toml");
+    let chart_yaml = workspace_root.join("chart/Chart.yaml");
+
+    // Cargo.toml: replace first version = "..." in [package] section
+    let contents = fs::read_to_string(&cargo_toml).context("reading Cargo.toml")?;
+    let mut replaced = false;
+    let new_contents: String = contents
+        .lines()
+        .map(|line| {
+            if !replaced && line.starts_with("version = \"") {
+                replaced = true;
+                format!("version = \"{version}\"")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Preserve trailing newline
+    let new_contents = if contents.ends_with('\n') && !new_contents.ends_with('\n') {
+        new_contents + "\n"
+    } else {
+        new_contents
+    };
+    fs::write(&cargo_toml, &new_contents).context("writing Cargo.toml")?;
+
+    // chart/Chart.yaml: replace version and appVersion
+    let contents = fs::read_to_string(&chart_yaml).context("reading chart/Chart.yaml")?;
+    let new_contents: String = contents
+        .lines()
+        .map(|line| {
+            if line.starts_with("version:") {
+                format!("version: {version}")
+            } else if line.starts_with("appVersion:") {
+                format!("appVersion: \"{version}\"")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let new_contents = if contents.ends_with('\n') && !new_contents.ends_with('\n') {
+        new_contents + "\n"
+    } else {
+        new_contents
+    };
+    fs::write(&chart_yaml, &new_contents).context("writing chart/Chart.yaml")?;
+
+    // Update Cargo.lock
+    let status = Command::new("cargo")
+        .args(["update", "--workspace"])
+        .current_dir(workspace_root)
+        .status()
+        .context("running cargo update")?;
+    if !status.success() {
+        bail!("cargo update failed");
+    }
+
+    Ok(())
 }
 
 fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
