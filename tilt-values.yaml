@@ -10,6 +10,9 @@ externalDns:
   mtls:
     enabled: true
 
+devCleanup:
+  enabled: true
+
 resources:
   requests:
     cpu: 10m

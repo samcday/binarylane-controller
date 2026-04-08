@@ -194,6 +194,16 @@ helm_resource(
     labels=["dns"],
 )
 
+# Dev-cleanup heartbeat: keep the dev-heartbeat Secret updated while Tilt is
+# running. When Tilt stops (e.g. Codespace is stopped/deleted), the heartbeat
+# goes stale and the dev-cleanup controller tears down all BL resources.
+local_resource(
+    'heartbeat',
+    serve_cmd='while true; do kubectl -n binarylane-system apply -f - <<YAML\napiVersion: v1\nkind: Secret\nmetadata:\n  name: dev-heartbeat\n  namespace: binarylane-system\n  labels:\n    blc.samcday.com/dev-heartbeat: "true"\nstringData:\n  timestamp: "$(date +%s)"\nYAML\nsleep 300; done',
+    resource_deps=['binarylane-controller'],
+    labels=["dev"],
+)
+
 # Scale-test deployment for exercising the autoscaler. Created with replicas=0
 # so it doesn't trigger scale-up by default. Use kubectl to scale:
 #   kubectl scale deploy/scale-test --replicas=3   # force node scale-up

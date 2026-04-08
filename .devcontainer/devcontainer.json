@@ -1,0 +1,39 @@
+{
+  "name": "BinaryLane Controller",
+  "build": { "dockerfile": "Dockerfile" },
+  "onCreateCommand": "cargo build --workspace --locked",
+  "updateContentCommand": "cargo clippy --workspace --locked",
+  "postAttachCommand": "echo '\\nRun: eval \"$(cargo xtask dev-up)\" && tilt up --port 10350\\n'",
+  "hostRequirements": { "cpus": 4, "memory": "8gb", "storage": "32gb" },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/kubectl-helm-minikube:1": { "minikube": "none" }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "ms-kubernetes-tools.vscode-kubernetes-tools",
+        "tilt-dev.Tiltfile"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "vs-kubernetes.vs-kubernetes.kubeconfig": "${containerWorkspaceFolder}/.dev/kubeconfig"
+      }
+    }
+  },
+  "secrets": {
+    "BL_API_TOKEN": {
+      "description": "BinaryLane API token for provisioning dev infrastructure",
+      "documentationUrl": "https://home.binarylane.com.au/api-info"
+    }
+  },
+  "forwardPorts": [10350],
+  "portsAttributes": {
+    "10350": { "label": "Tilt Dashboard", "onAutoForward": "openPreview" }
+  },
+  "remoteEnv": {
+    "KUBECONFIG": "${containerWorkspaceFolder}/.dev/kubeconfig",
+    "CARGO_TERM_COLOR": "always"
+  }
+}

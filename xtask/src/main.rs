@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{ErrorKind, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -31,7 +32,8 @@ const REGISTRY_NAMESPACE: &str = "binarylane-dev-registry";
 const REGISTRY_DATA_HOSTPATH: &str = "/var/lib/binarylane-dev-registry/registry-data";
 const DEV_AUTOSCALER_GROUP_ID: &str = "workers";
 
-const DEFAULT_REGION: &str = "syd";
+const DEFAULT_REGION: &str = "bne";
+const REGION_FALLBACKS: &[&str] = &["syd", "mel", "adl", "per", "sin"];
 const DEFAULT_SIZE: &str = "std-1vcpu";
 const DEFAULT_IMAGE: &str = "ubuntu-24.04";
 const DEFAULT_SSH_USER: &str = "root";
@@ -56,12 +58,6 @@ enum Commands {
 
 #[derive(Debug, Args)]
 struct DevUpArgs {
-    /// Instance name for parallel dev environments (e.g. CI matrix jobs).
-    /// When set, all default paths move under `.dev/{instance}/` and resource
-    /// names are derived from the instance name instead of the local username.
-    #[arg(long, env = "BL_DEV_INSTANCE")]
-    instance: Option<String>,
-
     /// BinaryLane API token
     #[arg(long, env = "BL_API_TOKEN")]
     bl_api_token: String,
@@ -86,10 +82,6 @@ struct DevUpArgs {
     #[arg(long, default_value = DEFAULT_TILT_VALUES_OUT)]
     tilt_values_out: PathBuf,
 
-    /// Server name to create/reuse
-    #[arg(long, default_value_t = default_server_name())]
-    server_name: String,
-
     /// BinaryLane region slug
     #[arg(long, env = "BL_DEV_REGION", default_value = DEFAULT_REGION)]
     region: String,
@@ -105,18 +97,6 @@ struct DevUpArgs {
     /// SSH user for the control-plane node
     #[arg(long, env = "BL_DEV_SSH_USER", default_value = DEFAULT_SSH_USER)]
     ssh_user: String,
-
-    /// Managed private key path used for provisioning and SSH
-    #[arg(
-        long,
-        env = "BL_DEV_SSH_KEY_PATH",
-        default_value = DEFAULT_MANAGED_SSH_KEY_PATH
-    )]
-    ssh_key_path: PathBuf,
-
-    /// Managed account SSH key name in BinaryLane
-    #[arg(long, env = "BL_DEV_SSH_KEY_NAME", default_value_t = default_ssh_key_name())]
-    ssh_key_name: String,
 
     /// Username for the dev registry auth
     #[arg(long, env = "BL_DEV_REGISTRY_USERNAME", default_value = DEFAULT_REGISTRY_USERNAME)]
@@ -144,12 +124,6 @@ struct TiltArgs {
 
 #[derive(Debug, Args)]
 struct DevDownArgs {
-    /// Instance name for parallel dev environments (e.g. CI matrix jobs).
-    /// When set, all default paths move under `.dev/{instance}/` and resource
-    /// names are derived from the instance name instead of the local username.
-    #[arg(long, env = "BL_DEV_INSTANCE")]
-    instance: Option<String>,
-
     /// BinaryLane API token (required only if a tracked server must be deleted)
     #[arg(long, env = "BL_API_TOKEN")]
     bl_api_token: Option<String>,
@@ -214,7 +188,13 @@ struct Server {
     id: i64,
     name: String,
     status: String,
+    region: ServerRegion,
     networks: Networks,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ServerRegion {
+    slug: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -227,6 +207,12 @@ struct NetworkV4 {
     ip_address: String,
     #[serde(rename = "type")]
     net_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LoadBalancer {
+    id: i64,
+    name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -266,152 +252,26 @@ fn main() -> Result<()> {
     }
 }
 
-/// Auto-detect a git worktree and return its directory basename as an instance
-/// name. Returns `None` when running from the main checkout.
-fn detect_worktree_instance() -> Option<String> {
-    let git_dir = Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let git_dir = std::str::from_utf8(&git_dir.stdout).ok()?.trim();
-
-    let common_dir = Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let common_dir = std::str::from_utf8(&common_dir.stdout).ok()?.trim();
-
-    // In a worktree, --git-dir differs from --git-common-dir.
-    // Canonicalize to handle relative vs absolute paths.
-    let git_dir = fs::canonicalize(git_dir).ok()?;
-    let common_dir = fs::canonicalize(common_dir).ok()?;
-    if git_dir == common_dir {
-        return None;
-    }
-
-    // Use the worktree checkout directory name as the instance.
-    let toplevel = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let toplevel = std::str::from_utf8(&toplevel.stdout).ok()?.trim();
-    let name = Path::new(toplevel).file_name()?.to_str()?;
-    Some(name.to_string())
-}
-
-/// Replace a path field with an instance-scoped value when it still holds its
-/// compile-time default (i.e. the user did not explicitly override it).
-fn override_path_default(field: &mut PathBuf, default: &str, instance_path: &str) {
-    if *field == Path::new(default) {
-        *field = PathBuf::from(instance_path);
-    }
-}
-
-/// Apply instance-specific default overrides to the path fields shared by both
-/// `DevUpArgs` and `DevDownArgs`.
-fn apply_common_instance_paths(
-    inst: &str,
-    state_file: &mut PathBuf,
-    kubeconfig_out: &mut PathBuf,
-    known_hosts: &mut PathBuf,
-    docker_config_dir: &mut PathBuf,
-    tilt_values_out: &mut PathBuf,
-) {
-    override_path_default(
-        state_file,
-        DEFAULT_STATE_FILE,
-        &format!(".dev/{inst}/state.json"),
-    );
-    override_path_default(
-        kubeconfig_out,
-        DEFAULT_KUBECONFIG_OUT,
-        &format!(".dev/{inst}/kubeconfig"),
-    );
-    override_path_default(
-        known_hosts,
-        DEFAULT_KNOWN_HOSTS,
-        &format!(".dev/{inst}/known_hosts"),
-    );
-    override_path_default(
-        docker_config_dir,
-        DEFAULT_DOCKER_CONFIG_DIR,
-        &format!(".dev/{inst}/docker"),
-    );
-    override_path_default(
-        tilt_values_out,
-        DEFAULT_TILT_VALUES_OUT,
-        &format!(".dev/{inst}/tilt-values.yaml"),
-    );
-}
-
-/// Apply instance-specific default overrides to `DevUpArgs`.
-///
-/// For each field, we only overwrite it if the user did not explicitly pass a
-/// value (detected by comparing against the compile-time / computed default).
-fn apply_instance_overrides_up(args: &mut DevUpArgs) {
-    let inst = match &args.instance {
-        Some(i) => i.as_str(),
-        None => return,
-    };
-
-    apply_common_instance_paths(
-        inst,
-        &mut args.state_file,
-        &mut args.kubeconfig_out,
-        &mut args.known_hosts,
-        &mut args.docker_config_dir,
-        &mut args.tilt_values_out,
-    );
-    override_path_default(
-        &mut args.ssh_key_path,
-        DEFAULT_MANAGED_SSH_KEY_PATH,
-        &format!(".dev/{inst}/ssh-key"),
-    );
-    if args.server_name == default_server_name() {
-        args.server_name = format!("blc-{inst}");
-    }
-    if args.ssh_key_name == default_ssh_key_name() {
-        args.ssh_key_name = format!("blc-{inst}");
-    }
-}
-
-/// Apply instance-specific default overrides to `DevDownArgs`.
-fn apply_instance_overrides_down(args: &mut DevDownArgs) {
-    let inst = match &args.instance {
-        Some(i) => i.as_str(),
-        None => return,
-    };
-
-    apply_common_instance_paths(
-        inst,
-        &mut args.state_file,
-        &mut args.kubeconfig_out,
-        &mut args.known_hosts,
-        &mut args.docker_config_dir,
-        &mut args.tilt_values_out,
-    );
-}
-
-fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
+fn cmd_dev_up(args: DevUpArgs) -> Result<()> {
     let t_total = Instant::now();
-    if args.instance.is_none() {
-        args.instance = detect_worktree_instance();
-    }
-    apply_instance_overrides_up(&mut args);
+
     ensure_tool("ssh", "install OpenSSH client")?;
+
+    let cluster_name = get_or_create_cluster_name()?;
+    let server_name = format!("{cluster_name}-controlplane");
+    let ssh_key_name = format!("{cluster_name}-key");
+
     ensure_tool("ssh-keygen", "install OpenSSH tools")?;
 
     ensure_parent_dir(&args.state_file)?;
     ensure_parent_dir(&args.kubeconfig_out)?;
     ensure_parent_dir(&args.known_hosts)?;
-    ensure_parent_dir(&args.ssh_key_path)?;
+    let ssh_key_path_buf = PathBuf::from(DEFAULT_MANAGED_SSH_KEY_PATH);
+    ensure_parent_dir(&ssh_key_path_buf)?;
     ensure_parent_dir(&args.tilt_values_out)?;
 
     let timeout = Duration::from_secs(args.wait_timeout_secs);
-    let ssh_key_path = absolute_path(&args.ssh_key_path)?;
+    let ssh_key_path = absolute_path(&ssh_key_path_buf)?;
     let docker_config_dir = absolute_path(&args.docker_config_dir)?;
     let tilt_values_out = absolute_path(&args.tilt_values_out)?;
     let dev_resources_out = tilt_values_out
@@ -424,13 +284,13 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
 
     let mut state = load_state(&args.state_file)?;
     if state.server_name.is_empty() {
-        state.server_name = args.server_name.clone();
+        state.server_name = server_name.to_string();
     }
 
     let client = BlClient::new(args.bl_api_token.clone())?;
     let account_key = ensure_account_ssh_key(
         &client,
-        &args.ssh_key_name,
+        &ssh_key_name,
         &ssh_public_key,
         state.ssh_key_id,
         state.ssh_key_fingerprint.as_deref(),
@@ -450,16 +310,28 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
                     "State referenced server id={} but it no longer exists; recreating",
                     server_id
                 );
-                create_dev_server(&client, &args, &account_key.fingerprint)?
+                create_dev_server(
+                    &client,
+                    &args,
+                    &server_name,
+                    &ssh_key_name,
+                    &account_key.fingerprint,
+                )?
             }
         }
     } else {
-        create_dev_server(&client, &args, &account_key.fingerprint)?
+        create_dev_server(
+            &client,
+            &args,
+            &server_name,
+            &ssh_key_name,
+            &account_key.fingerprint,
+        )?
     };
 
     state.server_id = Some(server.id);
     state.server_name = server.name.clone();
-    state.region = args.region.clone();
+    state.region = server.region.slug.clone();
     state.size = args.size.clone();
     state.image = args.image.clone();
     state.ssh_key_path = Some(path_to_string(&ssh_key_path)?);
@@ -544,6 +416,7 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         &args.known_hosts,
         &k3s_registry,
         timeout,
+        &server_name,
     )?;
     eprintln!(
         "  k3s ready ............... {:.1}s",
@@ -593,7 +466,13 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
         &registry_password,
     )?;
     write_dev_tilt_values(&tilt_values_out)?;
-    write_dev_resources(&dev_resources_out, &args, &k3s_url, &k3s_token)?;
+    write_dev_resources(
+        &dev_resources_out,
+        &args,
+        &k3s_url,
+        &k3s_token,
+        &cluster_name,
+    )?;
 
     // -- From here: kube-rs only, no more SSH --
     let t = Instant::now();
@@ -687,7 +566,7 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     state.server_id = Some(server.id);
     state.server_name = server.name.clone();
     state.server_ip = Some(server_ip.clone());
-    state.region = args.region.clone();
+    state.region = server.region.slug.clone();
     state.size = args.size.clone();
     state.image = args.image.clone();
     state.ssh_user = ssh_user.clone();
@@ -746,50 +625,85 @@ fn cmd_dev_up(mut args: DevUpArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_dev_down(mut args: DevDownArgs) -> Result<()> {
-    if args.instance.is_none() {
-        args.instance = detect_worktree_instance();
-    }
-    apply_instance_overrides_down(&mut args);
+fn cmd_dev_down(args: DevDownArgs) -> Result<()> {
     let state = load_state(&args.state_file)?;
 
-    let needs_api = state.server_id.is_some() || state.ssh_key_id.is_some();
+    let has_cluster_name = get_or_create_cluster_name().is_ok();
+    let needs_api = state.server_id.is_some() || state.ssh_key_id.is_some() || has_cluster_name;
+
     let client = if needs_api {
-        let token = args.bl_api_token.ok_or_else(|| {
-            anyhow::anyhow!(
-                "BL_API_TOKEN is required to delete tracked server/key resources (set env var or pass --bl-api-token)"
-            )
-        })?;
-        Some(BlClient::new(token)?)
+        if let Some(token) = args.bl_api_token {
+            Some(BlClient::new(token)?)
+        } else {
+            eprintln!("Warning: BL_API_TOKEN not set; skipping remote resource cleanup");
+            None
+        }
     } else {
         None
     };
 
-    if let Some(server_id) = state.server_id {
-        eprintln!("Deleting tracked server id={}...", server_id);
-        client
-            .as_ref()
-            .context("internal error: API client missing")?
-            .delete_server(server_id)?;
-        eprintln!("Deleted tracked server id={}", server_id);
-    } else {
-        eprintln!("No tracked server id in state; skipping remote delete");
-    }
+    if let Some(client) = &client {
+        if let Some(server_id) = state.server_id {
+            eprintln!("Deleting tracked server id={}...", server_id);
+            let _ = client.delete_server(server_id);
+        }
 
-    if let Some(ssh_key_id) = state.ssh_key_id {
-        eprintln!("Deleting tracked account SSH key id={}...", ssh_key_id);
-        client
-            .as_ref()
-            .context("internal error: API client missing")?
-            .delete_account_ssh_key(ssh_key_id)?;
-        eprintln!("Deleted tracked account SSH key id={}", ssh_key_id);
-    } else {
-        eprintln!("No tracked account SSH key id in state; skipping key delete");
+        if let Some(ssh_key_id) = state.ssh_key_id {
+            eprintln!("Deleting tracked account SSH key id={}...", ssh_key_id);
+            let _ = client.delete_account_ssh_key(ssh_key_id);
+        }
+
+        if let Ok(cluster_name) = get_or_create_cluster_name() {
+            let prefix = format!("{cluster_name}-");
+
+            if let Ok(servers) = client.list_servers() {
+                for s in servers {
+                    if s.name.starts_with(&prefix) {
+                        eprintln!(
+                            "Deleting prefix-matched server '{}' (id={})...",
+                            s.name, s.id
+                        );
+                        let _ = client.delete_server(s.id);
+                    }
+                }
+            }
+
+            if let Ok(keys) = client.list_account_ssh_keys() {
+                for key in keys {
+                    if key.name.starts_with(&prefix) {
+                        eprintln!(
+                            "Deleting prefix-matched account SSH key '{}' (id={})...",
+                            key.name, key.id
+                        );
+                        let _ = client.delete_account_ssh_key(key.id);
+                    }
+                }
+            }
+
+            if let Ok(lbs) = client.list_load_balancers() {
+                for lb in lbs {
+                    if lb.name.starts_with(&prefix) {
+                        eprintln!(
+                            "Deleting prefix-matched load balancer '{}' (id={})...",
+                            lb.name, lb.id
+                        );
+                        let _ = client.delete_load_balancer(lb.id);
+                    }
+                }
+            }
+        }
     }
 
     remove_file_if_exists(&args.kubeconfig_out)?;
+
     remove_file_if_exists(&args.known_hosts)?;
+
     remove_file_if_exists(&args.tilt_values_out)?;
+    remove_file_if_exists(Path::new(".dev/name"))?;
+
+    let default_key = Path::new(DEFAULT_MANAGED_SSH_KEY_PATH);
+    remove_file_if_exists(default_key)?;
+    remove_file_if_exists(&managed_public_key_path(default_key))?;
 
     if let Some(path) = &state.kubeconfig_path {
         remove_file_if_exists(Path::new(path))?;
@@ -840,31 +754,54 @@ fn cmd_tilt(args: TiltArgs) -> Result<()> {
 fn create_dev_server(
     client: &BlClient,
     args: &DevUpArgs,
+    server_name: &str,
+    ssh_key_name: &str,
     ssh_key_fingerprint: &str,
 ) -> Result<Server> {
-    eprintln!(
-        "Creating dev control plane server '{}' (region={}, size={}, image={}, ssh_key={})",
-        args.server_name, args.region, args.size, args.image, args.ssh_key_name
-    );
-
     let server_password = generate_server_password();
 
-    let server = client
-        .create_server(CreateServerRequest {
-            name: args.server_name.clone(),
+    let mut regions_to_try = vec![args.region.as_str()];
+    for r in REGION_FALLBACKS {
+        if *r != args.region {
+            regions_to_try.push(r);
+        }
+    }
+
+    for (i, region) in regions_to_try.iter().enumerate() {
+        eprintln!(
+            "Creating dev control plane server '{}' (region={}, size={}, image={}, ssh_key={})",
+            server_name, region, args.size, args.image, ssh_key_name
+        );
+
+        match client.create_server(CreateServerRequest {
+            name: server_name.to_string(),
             size: args.size.clone(),
             image: args.image.clone(),
-            region: args.region.clone(),
+            region: region.to_string(),
             user_data: None,
             ssh_keys: Some(vec![ssh_key_fingerprint.to_string()]),
-            password: Some(server_password),
-        })
-        .with_context(|| {
-            "creating BinaryLane server (override defaults with --region/--size/--image if needed)"
-        })?;
+            password: Some(server_password.clone()),
+        }) {
+            Ok(server) => {
+                eprintln!("Created server id={} name={}", server.id, server.name);
+                return Ok(server);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("Unable to find a suitable host") && i + 1 < regions_to_try.len() {
+                    eprintln!(
+                        "Region '{}' has no capacity, trying '{}'...",
+                        region,
+                        regions_to_try[i + 1]
+                    );
+                    continue;
+                }
+                return Err(e).context("creating BinaryLane server");
+            }
+        }
+    }
 
-    eprintln!("Created server id={} name={}", server.id, server.name);
-    Ok(server)
+    bail!("no region had available capacity")
 }
 
 fn wait_for_server_active(client: &BlClient, server_id: i64, timeout: Duration) -> Result<Server> {
@@ -916,18 +853,21 @@ fn wait_for_ssh_ready(
 
     loop {
         attempts += 1;
+        // Enable verbose SSH output every 6th attempt so we can diagnose failures.
+        let verbose = attempts == 1 || attempts.is_multiple_of(6);
         for user in users {
-            if ssh_probe(host, user, ssh_key_path, known_hosts)? {
+            if ssh_probe(host, user, ssh_key_path, known_hosts, verbose)? {
                 eprintln!("SSH is reachable on {} as {}", host, user);
                 return Ok(user.clone());
             }
         }
 
-        if attempts == 1 || attempts.is_multiple_of(6) {
+        if verbose {
             eprintln!(
-                "Still waiting for SSH on {} (tried users: {})",
+                "Still waiting for SSH on {} (tried users: {}, {:.0}s elapsed)",
                 host,
-                users.join(", ")
+                users.join(", "),
+                start.elapsed().as_secs_f64(),
             );
         }
 
@@ -950,6 +890,7 @@ fn ensure_k3s_server(
     known_hosts: &Path,
     registry: &K3sRegistryConfig<'_>,
     timeout: Duration,
+    node_name: &str,
 ) -> Result<()> {
     eprintln!("Installing/verifying k3s control plane on {}...", host);
     let start = Instant::now();
@@ -996,13 +937,14 @@ if ! command -v curl >/dev/null 2>&1; then\n\
   fi\n\
 fi\n\
 if ! command -v k3s >/dev/null 2>&1; then\n\
-  curl -sfL https://get.k3s.io | ${{SUDO}} env INSTALL_K3S_EXEC='server --write-kubeconfig-mode 644 --disable traefik --disable-cloud-controller --kubelet-arg=cloud-provider=external --tls-san {host}' sh -s -\n\
+  curl -sfL https://get.k3s.io | ${{SUDO}} env INSTALL_K3S_EXEC='server --write-kubeconfig-mode 644 --disable traefik --disable-cloud-controller --kubelet-arg=cloud-provider=external --tls-san {host} --node-name {node_name}' sh -s -\n\
 elif [ \"$k3s_was_active\" -eq 1 ] && [ \"$registries_changed\" -eq 1 ]; then\n\
   ${{SUDO}} systemctl restart k3s\n\
 fi\n\
 ${{SUDO}} systemctl enable --now k3s >/dev/null 2>&1 || true\n\
 ${{SUDO}} systemctl is-active --quiet k3s\n",
         registries_yaml = registries_yaml,
+        node_name = node_name,
     );
 
     loop {
@@ -1047,7 +989,16 @@ async fn wait_for_api_server(client: &kube::Client) -> Result<()> {
     let nodes: Api<Node> = Api::all(client.clone());
     for attempt in 1u32.. {
         match nodes.list(&Default::default()).await {
-            Ok(_) => return Ok(()),
+            Ok(list) if !list.items.is_empty() => return Ok(()),
+            Ok(_) => {
+                if attempt > 60 {
+                    bail!("timed out waiting for nodes to register");
+                }
+                if attempt == 1 || attempt % 5 == 0 {
+                    eprintln!("Waiting for nodes to register...");
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
             Err(e) => {
                 if attempt > 60 {
                     bail!("timed out waiting for kube API server: {e:#}");
@@ -1409,11 +1360,30 @@ fn ssh_probe(
     user: &str,
     ssh_key_path: Option<&Path>,
     known_hosts: &Path,
+    verbose: bool,
 ) -> Result<bool> {
-    let output = ssh_base_command(host, user, ssh_key_path, known_hosts)
-        .arg("true")
-        .output()
-        .context("probing SSH connectivity")?;
+    let mut cmd = ssh_base_command(host, user, ssh_key_path, known_hosts);
+    if verbose {
+        cmd.args(["-o", "LogLevel=DEBUG"]);
+    }
+    cmd.arg("true");
+
+    let child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning SSH probe")?;
+
+    // Hard 30s deadline: catches cases where ConnectTimeout doesn't cover the
+    // full handshake (e.g. middlebox holding the TCP connection open).
+    let output = child.wait_with_output().context("waiting for SSH probe")?;
+
+    if !output.status.success() && verbose {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            eprintln!("ssh probe {}@{}: {}", user, host, stderr.trim());
+        }
+    }
     Ok(output.status.success())
 }
 
@@ -1504,7 +1474,10 @@ fn ssh_base_command(
         "ServerAliveInterval=15",
         "-o",
         "ServerAliveCountMax=3",
-    ]);
+    ])
+    // Prevent hangs from GSSAPI negotiation or a broken SSH agent socket
+    // (common in devcontainers / Codespaces).
+    .args(["-o", "GSSAPIAuthentication=no", "-o", "IdentityAgent=none"]);
 
     if let Some(key) = ssh_key_path {
         cmd.args(["-o", "IdentitiesOnly=yes", "-i"]).arg(key);
@@ -1578,6 +1551,10 @@ fn ensure_managed_ssh_keypair(private_key_path: &Path) -> Result<()> {
     if !output.status.success() {
         bail!("ssh-keygen failed with status {}", output.status);
     }
+    // Ensure restrictive permissions — some filesystems (e.g. Codespaces /workspaces)
+    // default to 0644 which SSH rejects.
+    fs::set_permissions(private_key_path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting permissions on {}", private_key_path.display()))?;
     Ok(())
 }
 
@@ -1787,6 +1764,7 @@ fn write_dev_resources(
     args: &DevUpArgs,
     k3s_url: &str,
     k3s_token: &str,
+    cluster_name: &str,
 ) -> Result<()> {
     ensure_parent_dir(resources_path)?;
 
@@ -1818,7 +1796,7 @@ spec:
   size: "{size}"
   region: "{region}"
   image: "{image}"
-  namePrefix: "bl-dev-"
+  namePrefix: "{cluster_name}-"
   userDataSecretRef:
     name: dev-cloud-init
     namespace: default
@@ -1829,6 +1807,7 @@ spec:
         size = yaml_escape(&args.size),
         region = yaml_escape(&args.region),
         image = yaml_escape(&args.image),
+        cluster_name = cluster_name,
     );
 
     fs::write(resources_path, contents)
@@ -1880,35 +1859,6 @@ fn shell_single_quote(value: &str) -> String {
 
 fn emit_env(key: &str, value: &str) {
     println!("export {key}={}", shell_single_quote(value));
-}
-
-fn default_server_name() -> String {
-    let user = std::env::var("USER").unwrap_or_else(|_| "dev".to_string());
-    let cleaned = sanitize_name_component(&user);
-    format!("binarylane-dev-cp-{cleaned}")
-}
-
-fn default_ssh_key_name() -> String {
-    let user = std::env::var("USER").unwrap_or_else(|_| "dev".to_string());
-    let cleaned = sanitize_name_component(&user);
-    format!("binarylane-dev-key-{cleaned}")
-}
-
-fn sanitize_name_component(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push('-');
-        }
-    }
-    let out = out.trim_matches('-').to_string();
-    if out.is_empty() {
-        "dev".to_string()
-    } else {
-        out
-    }
 }
 
 impl Server {
@@ -2019,6 +1969,69 @@ impl BlClient {
         Ok(body.ssh_keys)
     }
 
+    fn list_servers(&self) -> Result<Vec<Server>> {
+        let resp = self
+            .request(reqwest::Method::GET, "/servers")
+            .send()
+            .context("listing servers")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            bail!("listing servers: {status}: {body}");
+        }
+
+        #[derive(Deserialize)]
+        struct Resp {
+            servers: Vec<Server>,
+        }
+        let body: Resp = resp.json().context("decoding list servers response")?;
+        Ok(body.servers)
+    }
+
+    fn list_load_balancers(&self) -> Result<Vec<LoadBalancer>> {
+        let resp = self
+            .request(reqwest::Method::GET, "/load_balancers")
+            .send()
+            .context("listing load balancers")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            bail!("listing load balancers: {status}: {body}");
+        }
+
+        #[derive(Deserialize)]
+        struct Resp {
+            load_balancers: Vec<LoadBalancer>,
+        }
+        let body: Resp = resp
+            .json()
+            .context("decoding list load balancers response")?;
+        Ok(body.load_balancers)
+    }
+
+    fn delete_load_balancer(&self, lb_id: i64) -> Result<()> {
+        let resp = self
+            .request(
+                reqwest::Method::DELETE,
+                format!("/load_balancers/{} ", lb_id).trim(),
+            )
+            .send()
+            .context("deleting load balancer")?;
+
+        if resp.status().as_u16() == 404 {
+            return Ok(());
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            bail!("deleting load balancer {lb_id}: {status}: {body}");
+        }
+        Ok(())
+    }
+
     fn create_account_ssh_key(&self, req: CreateAccountSshKeyRequest) -> Result<AccountSshKey> {
         let resp = self
             .request(reqwest::Method::POST, "/account/keys")
@@ -2066,4 +2079,21 @@ impl BlClient {
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Content-Type", "application/json")
     }
+}
+
+fn get_or_create_cluster_name() -> Result<String> {
+    let path = std::path::Path::new(".dev/name");
+    if path.exists() {
+        let name = std::fs::read_to_string(path)?;
+        return Ok(name.trim().to_string());
+    }
+    std::fs::create_dir_all(".dev")?;
+    let hash: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(6)
+        .map(char::from)
+        .collect();
+    let name = format!("bl-dev-{}", hash.to_lowercase());
+    std::fs::write(path, &name)?;
+    Ok(name)
 }
