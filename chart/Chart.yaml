@@ -2,5 +2,5 @@ apiVersion: v2
 name: binarylane-controller
 description: Kubernetes cloud provider controller for BinaryLane
 type: application
-version: 0.0.0
-appVersion: "0.0.0"
+version: 0.0.1-rc.1
+appVersion: "0.0.1-rc.1"
