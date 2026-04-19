@@ -1,0 +1,24 @@
+apiVersion: v1
+entries:
+  binarylane-controllers:
+  - apiVersion: v2
+    appVersion: 0.0.1-rc.2
+    created: "2026-04-19T09:25:41.171882129Z"
+    description: Kubernetes cloud provider controller for BinaryLane
+    digest: adf42c4d9bde296178c17e33dff3735f38f2bbdfb7232499b7bcaa24357a8d04
+    name: binarylane-controllers
+    type: application
+    urls:
+    - https://samcday.github.io/binarylane-controllers/binarylane-controllers-0.0.1-rc.2.tgz
+    version: 0.0.1-rc.2
+  binarylane-controllers-crds:
+  - apiVersion: v2
+    created: "2026-04-19T09:25:41.172032229Z"
+    description: CustomResourceDefinitions for binarylane-controllers
+    digest: baeed72c3ac1dfacc9477bd64c447fef7f596a1f9084a75ce9c5827fc4b458e6
+    name: binarylane-controllers-crds
+    type: application
+    urls:
+    - https://samcday.github.io/binarylane-controllers/binarylane-controllers-crds-0.1.0.tgz
+    version: 0.1.0
+generated: "2026-04-19T09:25:41.171290735Z"
