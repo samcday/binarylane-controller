@@ -3,7 +3,7 @@ members = [".", "binarylane-client", "integration-tests", "xtask"]
 
 [package]
 name = "binarylane-controller"
-version = "0.0.1-rc.1"
+version = "0.0.1-rc.2"
 edition = "2024"
 
 [dependencies]

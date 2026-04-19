@@ -321,12 +321,8 @@ async fn main() -> Result<()> {
         .await;
     });
 
-    let provider = autoscaler::Provider::new(
-        k8s.clone(),
-        bl.clone(),
-        asg_store,
-        args.namespace.clone(),
-    );
+    let provider =
+        autoscaler::Provider::new(k8s.clone(), bl.clone(), asg_store, args.namespace.clone());
     let svc = proto::cloud_provider_server::CloudProviderServer::new(provider);
 
     info!(
