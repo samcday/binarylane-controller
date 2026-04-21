@@ -1865,24 +1865,20 @@ fn write_dev_resources(
 ) -> Result<()> {
     ensure_parent_dir(resources_path)?;
 
-    let cloud_init_template =
+    let cloud_init =
         fs::read_to_string("dev-cloud-init.sh").context("reading dev-cloud-init.sh")?;
-    let cloud_init = cloud_init_template
-        .replace("{{.K3S_URL}}", k3s_url)
-        .replace("{{.K3S_TOKEN}}", k3s_token)
-        .replace("{{.NodeName}}", "$(hostname)")
-        .replace("{{.NodeGroup}}", DEV_AUTOSCALER_GROUP_ID);
 
     let contents = format!(
         r#"apiVersion: v1
 kind: Secret
 metadata:
-  name: dev-cloud-init
+  name: dev-k3s-join
   namespace: default
 type: Opaque
 stringData:
-  user-data: |
-{cloud_init}---
+  url: "{k3s_url}"
+  token: "{k3s_token}"
+---
 apiVersion: blc.samcday.com/v1alpha1
 kind: AutoScalingGroup
 metadata:
@@ -1894,10 +1890,21 @@ spec:
   region: "{region}"
   image: "{image}"
   namePrefix: "{cluster_name}-"
-  userDataSecretRef:
-    name: dev-cloud-init
-    namespace: default
-    key: user-data
+  userData: |
+{cloud_init}
+  templateVariables:
+    - name: k3sUrl
+      valueFrom:
+        secretKeyRef:
+          name: dev-k3s-join
+          namespace: default
+          key: url
+    - name: k3sToken
+      valueFrom:
+        secretKeyRef:
+          name: dev-k3s-join
+          namespace: default
+          key: token
 "#,
         cloud_init = indent_block(&cloud_init, 4),
         group_id = DEV_AUTOSCALER_GROUP_ID,
@@ -1905,6 +1912,8 @@ spec:
         region = yaml_escape(&args.region),
         image = yaml_escape(&args.image),
         cluster_name = cluster_name,
+        k3s_url = yaml_escape(k3s_url),
+        k3s_token = yaml_escape(k3s_token),
     );
 
     fs::write(resources_path, contents)

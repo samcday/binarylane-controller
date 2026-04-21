@@ -96,23 +96,100 @@ spec:
               size:
                 description: BinaryLane size slug
                 type: string
-              userDataSecretRef:
-                description: Reference to a Secret containing user-data for provisioned nodes
+              template:
+                description: Template applied to Nodes produced by this ASG. Labels/annotations/ taints defined here are merged with controller-owned values at scale-up time; user values that collide with reserved keys are dropped and reported as a Warning Event on the ASG.
                 nullable: true
                 properties:
-                  key:
-                    description: Key within the Secret. Defaults to "user-data" or "password" depending on context.
+                  metadata:
                     nullable: true
-                    type: string
-                  name:
-                    type: string
-                  namespace:
-                    description: Namespace of the Secret. Defaults to the controller's namespace.
+                    properties:
+                      annotations:
+                        additionalProperties:
+                          type: string
+                        description: Annotations to apply to provisioned Nodes.
+                        nullable: true
+                        type: object
+                      labels:
+                        additionalProperties:
+                          type: string
+                        description: Additional labels to apply to provisioned Nodes. Values that collide with controller-owned labels are dropped.
+                        nullable: true
+                        type: object
+                    type: object
+                  spec:
                     nullable: true
-                    type: string
-                required:
-                - name
+                    properties:
+                      taints:
+                        description: Additional taints to apply to provisioned Nodes. Entries whose key collides with controller-owned taints are dropped.
+                        items:
+                          properties:
+                            effect:
+                              description: 'One of: NoSchedule, PreferNoSchedule, NoExecute.'
+                              type: string
+                            key:
+                              type: string
+                            value:
+                              nullable: true
+                              type: string
+                          required:
+                          - effect
+                          - key
+                          type: object
+                        nullable: true
+                        type: array
+                    type: object
                 type: object
+              templateVariables:
+                description: Variables injected into the `userData` template, in addition to the built-in `node.*` and `asg.*` scopes.
+                items:
+                  properties:
+                    name:
+                      type: string
+                    value:
+                      nullable: true
+                      type: string
+                    valueFrom:
+                      nullable: true
+                      properties:
+                        configMapKeyRef:
+                          nullable: true
+                          properties:
+                            key:
+                              type: string
+                            name:
+                              type: string
+                            namespace:
+                              description: Namespace of the resource. Defaults to the controller's namespace.
+                              nullable: true
+                              type: string
+                          required:
+                          - key
+                          - name
+                          type: object
+                        secretKeyRef:
+                          nullable: true
+                          properties:
+                            key:
+                              type: string
+                            name:
+                              type: string
+                            namespace:
+                              description: Namespace of the resource. Defaults to the controller's namespace.
+                              nullable: true
+                              type: string
+                          required:
+                          - key
+                          - name
+                          type: object
+                      type: object
+                  required:
+                  - name
+                  type: object
+                type: array
+              userData:
+                description: 'Cloud-init user-data template (MiniJinja). Rendered per-node at scale-up. Built-in variables: `node.name`, `node.index`, `node.password`, `asg.name`, `asg.size`, `asg.region`, `asg.image`, `asg.namePrefix`, `asg.vcpus`, `asg.memoryMb`, `asg.diskGb`. User variables from `templateVariables` are available at the top level. Templating is evaluated at scale-up time only; Secret/ConfigMap changes do not re-render previously provisioned nodes.'
+                nullable: true
+                type: string
               vcpus:
                 description: Override vCPU count (defaults from BL size catalog if omitted)
                 format: int32

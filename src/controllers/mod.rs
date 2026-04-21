@@ -17,6 +17,7 @@ pub const FINALIZER: &str = "blc.samcday.com/server-cleanup";
 pub const UNINITIALIZED_TAINT: &str = "node.cloudprovider.kubernetes.io/uninitialized";
 
 // Labels
+pub const LABEL_ASG: &str = "blc.samcday.com/asg";
 pub const LABEL_SERVER_ID: &str = "bl.samcday.com/server-id";
 pub const LABEL_SIZE: &str = "bl.samcday.com/size";
 pub const LABEL_REGION: &str = "bl.samcday.com/region";
@@ -24,6 +25,25 @@ pub const LABEL_IMAGE: &str = "bl.samcday.com/image";
 
 // Annotations
 pub const ANNOTATION_ADOPT: &str = "bl.samcday.com/adopt";
+
+/// Labels set by the controller on every provisioned Node. User values from
+/// `spec.template.metadata.labels` that collide with these keys are dropped.
+pub const RESERVED_LABELS: &[&str] = &[
+    LABEL_ASG,
+    LABEL_SIZE,
+    LABEL_REGION,
+    LABEL_IMAGE,
+    "kubernetes.io/hostname",
+    "kubernetes.io/arch",
+    "kubernetes.io/os",
+    "node.kubernetes.io/instance-type",
+    "node.kubernetes.io/cloud-provider",
+    "topology.kubernetes.io/region",
+];
+
+/// Taint keys set by the controller on every provisioned Node. User taints
+/// from `spec.template.spec.taints` whose key matches are dropped.
+pub const RESERVED_TAINT_KEYS: &[&str] = &[UNINITIALIZED_TAINT];
 
 pub fn node_password_secret_name(node_name: &str) -> String {
     format!("{node_name}-node-password")
