@@ -17,6 +17,7 @@ pub const FINALIZER: &str = "blc.samcday.com/server-cleanup";
 pub const UNINITIALIZED_TAINT: &str = "node.cloudprovider.kubernetes.io/uninitialized";
 
 // Labels
+pub const LABEL_ASG: &str = "blc.samcday.com/asg";
 pub const LABEL_SERVER_ID: &str = "bl.samcday.com/server-id";
 pub const LABEL_SIZE: &str = "bl.samcday.com/size";
 pub const LABEL_REGION: &str = "bl.samcday.com/region";
@@ -24,6 +25,32 @@ pub const LABEL_IMAGE: &str = "bl.samcday.com/image";
 
 // Annotations
 pub const ANNOTATION_ADOPT: &str = "bl.samcday.com/adopt";
+
+/// Labels set by the controller on every provisioned Node. User values from
+/// `spec.template.metadata.labels` that collide with these keys are dropped.
+///
+/// `LABEL_SERVER_ID` is reserved even though the autoscaler doesn't set it at
+/// Node creation — it's written by `node_provision` once the BinaryLane server
+/// is created, and `node_provision::reconcile` treats its presence as "already
+/// provisioned" and skips server creation entirely. A user-supplied value here
+/// would leave the Node permanently uninitialized.
+pub const RESERVED_LABELS: &[&str] = &[
+    LABEL_ASG,
+    LABEL_SERVER_ID,
+    LABEL_SIZE,
+    LABEL_REGION,
+    LABEL_IMAGE,
+    "kubernetes.io/hostname",
+    "kubernetes.io/arch",
+    "kubernetes.io/os",
+    "node.kubernetes.io/instance-type",
+    "node.kubernetes.io/cloud-provider",
+    "topology.kubernetes.io/region",
+];
+
+/// Taint keys set by the controller on every provisioned Node. User taints
+/// from `spec.template.spec.taints` whose key matches are dropped.
+pub const RESERVED_TAINT_KEYS: &[&str] = &[UNINITIALIZED_TAINT];
 
 pub fn node_password_secret_name(node_name: &str) -> String {
     format!("{node_name}-node-password")

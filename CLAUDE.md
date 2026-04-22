@@ -55,7 +55,8 @@ binarylane-client/               REST client crate for BinaryLane v2 API
 - **Labels**: `bl.samcday.com/server-id` (queryable, set after bind/provision), `bl.samcday.com/size`, `bl.samcday.com/region`, `bl.samcday.com/image`.
 - **Associated resources**: Secret `{name}-node-password`, Secret `{name}-user-data`.
 - **Server ownership**: autoscaler identifies managed servers by name prefix (`<namePrefix><groupID>-`).
-- **Cloud-init templating**: simple `{{.Key}}` string replacement with vars from `TMPL_*` env vars plus built-in `NodeName`, `NodeGroup`, `Region`, `Size`.
+- **Cloud-init templating**: `spec.userData` on an `AutoScalingGroup` is a MiniJinja template, rendered per-node at scale-up. Built-in scopes: `node.{name,hostname,index,password}` and `asg.{name,size,region,image,namePrefix,vcpus,memoryMb,diskGb}`. Extra variables come from `spec.templateVariables` as literals or Secret/ConfigMap refs. Strict-undefined: typos in `{{ asg.naem }}` fail scale-up.
+- **Node template**: `spec.template` mirrors `Deployment.spec.template` — `metadata.{labels,annotations}` and `spec.taints` are merged onto every provisioned Node. Reserved keys (hostname, arch, os, the uninitialized taint, etc.) are controller-owned and drop user overrides with a Warning Event. Values flow through both real Node creation and the cluster-autoscaler `NodeGroupTemplateNodeInfo` simulator so scheduling simulation stays honest.
 
 ### Environment variables
 
@@ -64,10 +65,7 @@ binarylane-client/               REST client crate for BinaryLane v2 API
 | `BL_API_TOKEN` | yes | | BinaryLane API token |
 | `CONTROLLERS` | no | `*` | Controller selection (comma-separated) |
 | `NAMESPACE` | no | `binarylane-system` | Target-cluster namespace for per-node Secrets |
-| `CONFIG_PATH` | no | `/etc/binarylane-controller/config.json` | Autoscaler node group config |
-| `CLOUD_INIT_PATH` | no | `/etc/binarylane-controller/cloud-init.sh` | Cloud-init template file |
 | `GRPC_LISTEN_ADDR` | no | `0.0.0.0:8086` | gRPC listen address |
 | `TLS_CERT_PATH` | no | | TLS cert (enables mTLS when all three TLS vars set) |
 | `TLS_KEY_PATH` | no | | TLS private key |
 | `TLS_CA_PATH` | no | | TLS CA certificate |
-| `TMPL_*` | no | | Template variables for cloud-init |

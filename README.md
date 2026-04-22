@@ -27,10 +27,66 @@ docker run -e BL_API_TOKEN=<your-token> binarylane-controller
 |---|---|---|---|
 | `BL_API_TOKEN` | yes | | BinaryLane API token |
 | `KUBECONFIG` | no | in-cluster | Path to kubeconfig |
-| `CONFIG_PATH` | no | `/etc/binarylane-controller/config.json` | Autoscaler node group config |
-| `CLOUD_INIT_PATH` | no | `/etc/binarylane-controller/cloud-init.sh` | Cloud-init template file |
+| `NAMESPACE` | no | `binarylane-system` | Target-cluster namespace for per-node Secrets |
 | `GRPC_LISTEN_ADDR` | no | `:8086` | gRPC listen address |
-| `TMPL_*` | no | | Extra variables passed into the cloud-init template |
+
+## AutoScalingGroup templating
+
+An `AutoScalingGroup` declares the shape of Nodes to be provisioned. Two
+templating layers are available:
+
+**`spec.userData`** is a [MiniJinja](https://docs.rs/minijinja) cloud-init
+template, rendered per-node at scale-up time. Built-in variables:
+
+- `node.name`, `node.hostname`, `node.index`, `node.password`
+- `asg.name`, `asg.size`, `asg.region`, `asg.image`, `asg.namePrefix`
+- `asg.vcpus`, `asg.memoryMb`, `asg.diskGb`
+
+Additional variables go under `spec.templateVariables`; each variable is
+either a literal value or a reference to a Secret / ConfigMap key. Values
+are resolved once per scale-up RPC and shared across every Node it creates.
+Because cloud-init only runs at first boot, changing a referenced Secret
+after a Node is provisioned does not re-render the Node's user-data.
+
+**`spec.template`** sets labels, annotations, and taints on every Node
+created by the ASG — mirroring `Deployment.spec.template`. Controller-owned
+keys (for example `kubernetes.io/hostname`, the uninitialized taint) take
+precedence; colliding user values are dropped and surfaced as a Warning
+Event on the ASG.
+
+```yaml
+apiVersion: blc.samcday.com/v1alpha1
+kind: AutoScalingGroup
+metadata:
+  name: gpu-workers
+spec:
+  minSize: 0
+  maxSize: 3
+  size: gpu-1
+  region: syd
+  image: ubuntu-22.04
+  userData: |
+    #cloud-config
+    runcmd:
+      - kubeadm join cp.internal:6443 \
+          --token {{ joinToken }} \
+          --node-name {{ node.name }}
+  templateVariables:
+    - name: joinToken
+      valueFrom:
+        secretKeyRef:
+          name: kubeadm-join-token
+          key: token
+  template:
+    metadata:
+      labels:
+        role: gpu-worker
+    spec:
+      taints:
+        - key: gpu
+          value: "true"
+          effect: NoSchedule
+```
 
 ## Remote dev control plane
 

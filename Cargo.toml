@@ -15,6 +15,7 @@ futures = "0.3"
 k8s-openapi = { version = "0.25", features = ["v1_33"] }
 k8s-pb = "0.9"
 kube = { version = "1", features = ["runtime", "client", "derive", "rustls-tls"], default-features = false }
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde"] }
 prost = "0.13"
 prost-types = "0.13"
 prost_014 = { package = "prost", version = "0.14" }

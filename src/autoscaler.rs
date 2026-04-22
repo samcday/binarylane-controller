@@ -2,9 +2,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use k8s_openapi::api::core::v1::{
-    Node as K8sNode, NodeSpec as K8sNodeSpec, Secret as K8sSecret, Taint as K8sTaint,
+    Event as K8sEvent, EventSource as K8sEventSource, Node as K8sNode, NodeSpec as K8sNodeSpec,
+    ObjectReference as K8sObjectReference, Secret as K8sSecret, Taint as K8sTaint,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta as K8sObjectMeta;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
+    ObjectMeta as K8sObjectMeta, Time as K8sTime,
+};
 use k8s_pb::api::core::v1::{Node, NodeCondition, NodeSpec, NodeStatus, Taint};
 use k8s_pb::apimachinery::pkg::api::resource::Quantity;
 use k8s_pb::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -21,6 +24,7 @@ use crate::proto;
 use binarylane_controller::crd::{
     AutoScalingGroup, AutoScalingGroupSpec, AutoScalingGroupStatus, SecretRef,
 };
+use binarylane_controller::user_data::{self, AsgVars, BuiltinVars, NodeVars};
 
 pub struct Provider {
     k8s: kube::Client,
@@ -28,6 +32,19 @@ pub struct Provider {
     store: Store<AutoScalingGroup>,
     secret_namespace: String,
     size_cache: tokio::sync::Mutex<Option<Vec<binarylane::ListedSize>>>,
+}
+
+struct NodeTaintTuple {
+    key: String,
+    value: Option<String>,
+    effect: String,
+}
+
+struct NodeAttrs {
+    labels: BTreeMap<String, String>,
+    annotations: BTreeMap<String, String>,
+    taints: Vec<NodeTaintTuple>,
+    dropped: Vec<String>,
 }
 
 impl Provider {
@@ -84,9 +101,17 @@ impl Provider {
             .collect())
     }
 
-    fn node_labels(&self, asg_name: &str, spec: &AutoScalingGroupSpec) -> BTreeMap<String, String> {
-        let mut labels = BTreeMap::new();
-        labels.insert("blc.samcday.com/asg".to_string(), asg_name.to_string());
+    /// Build the labels, annotations, and taints applied to a provisioned Node.
+    /// Controller-owned values are set first; user values from `spec.template`
+    /// are merged on top, with collisions against `RESERVED_LABELS` /
+    /// `RESERVED_TAINT_KEYS` dropped. `dropped` holds the dropped keys so the
+    /// caller can emit a Warning Event.
+    ///
+    /// Per-node values (`kubernetes.io/hostname`) are not added here — add
+    /// them after calling this helper.
+    fn build_node_labels_and_taints(asg_name: &str, spec: &AutoScalingGroupSpec) -> NodeAttrs {
+        let mut labels: BTreeMap<String, String> = BTreeMap::new();
+        labels.insert(controllers::LABEL_ASG.to_string(), asg_name.to_string());
         labels.insert(
             "node.kubernetes.io/instance-type".to_string(),
             spec.size.clone(),
@@ -102,7 +127,114 @@ impl Provider {
             "node.kubernetes.io/cloud-provider".to_string(),
             binarylane::PROVIDER_NAME.to_string(),
         );
-        labels
+        labels.insert(controllers::LABEL_SIZE.to_string(), spec.size.clone());
+        labels.insert(controllers::LABEL_REGION.to_string(), spec.region.clone());
+        labels.insert(controllers::LABEL_IMAGE.to_string(), spec.image.clone());
+
+        let mut taints: Vec<NodeTaintTuple> = vec![NodeTaintTuple {
+            key: controllers::UNINITIALIZED_TAINT.to_string(),
+            value: Some("true".to_string()),
+            effect: "NoSchedule".to_string(),
+        }];
+
+        let mut annotations: BTreeMap<String, String> = BTreeMap::new();
+        let mut dropped: Vec<String> = Vec::new();
+
+        if let Some(template) = &spec.template {
+            if let Some(meta) = &template.metadata {
+                if let Some(user_labels) = &meta.labels {
+                    for (k, v) in user_labels {
+                        if controllers::RESERVED_LABELS.contains(&k.as_str()) {
+                            dropped.push(format!("label:{k}"));
+                            continue;
+                        }
+                        labels.insert(k.clone(), v.clone());
+                    }
+                }
+                if let Some(user_annotations) = &meta.annotations {
+                    for (k, v) in user_annotations {
+                        annotations.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            if let Some(template_spec) = &template.spec
+                && let Some(user_taints) = &template_spec.taints
+            {
+                for t in user_taints {
+                    if controllers::RESERVED_TAINT_KEYS.contains(&t.key.as_str()) {
+                        dropped.push(format!("taint:{}", t.key));
+                        continue;
+                    }
+                    taints.push(NodeTaintTuple {
+                        key: t.key.clone(),
+                        value: t.value.clone(),
+                        effect: t.effect.clone(),
+                    });
+                }
+            }
+        }
+
+        NodeAttrs {
+            labels,
+            annotations,
+            taints,
+            dropped,
+        }
+    }
+
+    /// Resolve vcpus/memoryMb/diskGb for an ASG, preferring spec overrides and
+    /// falling back to the BinaryLane size catalog.
+    async fn asg_size_info(&self, spec: &AutoScalingGroupSpec) -> Result<(i32, i32, i32), Status> {
+        if let (Some(v), Some(m), Some(d)) = (spec.vcpus, spec.memory_mb, spec.disk_gb) {
+            return Ok((v, m, d));
+        }
+        let sizes = self.get_sizes().await?;
+        let size = sizes
+            .iter()
+            .find(|s| s.slug == spec.size)
+            .ok_or_else(|| Status::not_found(format!("BinaryLane size {} not found", spec.size)))?;
+        Ok((
+            spec.vcpus.unwrap_or(size.vcpus),
+            spec.memory_mb.unwrap_or(size.memory),
+            spec.disk_gb.unwrap_or(size.disk),
+        ))
+    }
+
+    async fn emit_asg_warning(&self, asg: &AutoScalingGroup, reason: &str, message: &str) {
+        let Some(asg_name) = asg.metadata.name.as_deref() else {
+            return;
+        };
+        let now = K8sTime(k8s_openapi::chrono::Utc::now());
+        let event = K8sEvent {
+            metadata: K8sObjectMeta {
+                generate_name: Some("binarylane-autoscaler-".to_string()),
+                namespace: Some(self.secret_namespace.clone()),
+                ..Default::default()
+            },
+            involved_object: K8sObjectReference {
+                api_version: Some("blc.samcday.com/v1alpha1".to_string()),
+                kind: Some("AutoScalingGroup".to_string()),
+                name: Some(asg_name.to_string()),
+                uid: asg.metadata.uid.clone(),
+                ..Default::default()
+            },
+            reason: Some(reason.to_string()),
+            message: Some(message.to_string()),
+            type_: Some("Warning".to_string()),
+            source: Some(K8sEventSource {
+                component: Some("binarylane-autoscaler".to_string()),
+                ..Default::default()
+            }),
+            first_timestamp: Some(now.clone()),
+            last_timestamp: Some(now),
+            count: Some(1),
+            action: Some("Scale".to_string()),
+            ..Default::default()
+        };
+        let events_api: Api<K8sEvent> = Api::namespaced(self.k8s.clone(), &self.secret_namespace);
+        if let Err(e) = events_api.create(&Default::default(), &event).await {
+            warn!(asg = %asg_name, error = %e, reason, "failed to emit ASG event");
+        }
     }
 
     async fn read_secret_value(
@@ -464,22 +596,66 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
         }
 
         let password = self.ensure_password(&asg).await?;
-        let user_data = if let Some(secret_ref) = &asg.spec.user_data_secret_ref {
-            Some(self.read_secret_value(secret_ref, "user-data").await?)
-        } else {
-            None
-        };
+
+        // Resolve template inputs once per RPC — values are shared across all
+        // nodes created in this scale-up. If the template uses any asg.vcpus /
+        // asg.memoryMb / asg.diskGb variables, we need the numbers even when
+        // the user didn't set explicit overrides.
+        let (vcpus, memory_mb, disk_gb) = self.asg_size_info(&asg.spec).await?;
+        let user_vars = user_data::resolve_variables(
+            &self.k8s,
+            &self.secret_namespace,
+            &asg.spec.template_variables,
+        )
+        .await
+        .map_err(Status::from)?;
+
+        let NodeAttrs {
+            labels: base_labels,
+            annotations,
+            taints: base_taints,
+            dropped,
+        } = Self::build_node_labels_and_taints(&asg_name, &asg.spec);
+        if !dropped.is_empty() {
+            let msg = format!(
+                "dropped reserved keys from spec.template: {}",
+                dropped.join(", ")
+            );
+            warn!(asg = %asg_name, dropped = ?dropped, "reserved keys dropped from spec.template");
+            self.emit_asg_warning(&asg, "ReservedKeyDropped", &msg)
+                .await;
+        }
 
         let node_api: Api<K8sNode> = Api::all(self.k8s.clone());
         for i in 0..req.delta {
             let ts = chrono_like_timestamp();
             let name = format!("{}{}-{ts}-{i}", asg.spec.name_prefix, asg_name);
 
-            if let Some(user_data) = &user_data {
+            if let Some(template) = asg.spec.user_data.as_deref() {
+                let builtins = BuiltinVars {
+                    node: NodeVars {
+                        name: name.clone(),
+                        hostname: name.clone(),
+                        index: i,
+                        password: password.clone(),
+                    },
+                    asg: AsgVars {
+                        name: asg_name.clone(),
+                        size: asg.spec.size.clone(),
+                        region: asg.spec.region.clone(),
+                        image: asg.spec.image.clone(),
+                        name_prefix: asg.spec.name_prefix.clone(),
+                        vcpus: Some(vcpus),
+                        memory_mb: Some(memory_mb),
+                        disk_gb: Some(disk_gb),
+                    },
+                };
+                let rendered =
+                    user_data::render(template, &builtins, &user_vars).map_err(Status::from)?;
                 self.create_secret(
                     &controllers::user_data_secret_name(&name),
                     "user-data",
-                    user_data,
+                    &rendered,
                 )
                 .await?;
             }
@@ -491,29 +667,33 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
             )
             .await?;
 
-            let mut labels = self.node_labels(&asg_name, &asg.spec);
+            let mut labels = base_labels.clone();
             labels.insert("kubernetes.io/hostname".to_string(), name.clone());
-            labels.insert(controllers::LABEL_SIZE.to_string(), asg.spec.size.clone());
-            labels.insert(
-                controllers::LABEL_REGION.to_string(),
-                asg.spec.region.clone(),
-            );
-            labels.insert(controllers::LABEL_IMAGE.to_string(), asg.spec.image.clone());
+
+            let taints = base_taints
+                .iter()
+                .map(|t| K8sTaint {
+                    key: t.key.clone(),
+                    value: t.value.clone(),
+                    effect: t.effect.clone(),
+                    ..Default::default()
+                })
+                .collect();
 
             let node = K8sNode {
                 metadata: K8sObjectMeta {
                     name: Some(name.clone()),
                     labels: Some(labels),
+                    annotations: if annotations.is_empty() {
+                        None
+                    } else {
+                        Some(annotations.clone())
+                    },
                     finalizers: Some(vec![controllers::FINALIZER.to_string()]),
                     ..Default::default()
                 },
                 spec: Some(K8sNodeSpec {
-                    taints: Some(vec![K8sTaint {
-                        key: controllers::UNINITIALIZED_TAINT.to_string(),
-                        value: Some("true".to_string()),
-                        effect: "NoSchedule".to_string(),
-                        ..Default::default()
-                    }]),
+                    taints: Some(taints),
                     ..Default::default()
                 }),
                 status: None,
@@ -658,7 +838,12 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
             .or_else(|| size_info.as_ref().map(|s| s.disk))
             .ok_or_else(|| Status::internal("missing disk for template node info".to_string()))?;
 
-        let mut labels = self.node_labels(&asg_name, &asg.spec);
+        let NodeAttrs {
+            mut labels,
+            annotations,
+            taints: taint_tuples,
+            dropped: _,
+        } = Self::build_node_labels_and_taints(&asg_name, &asg.spec);
         labels.insert(
             "kubernetes.io/hostname".to_string(),
             format!("template-{asg_name}"),
@@ -716,20 +901,30 @@ impl proto::cloud_provider_server::CloudProvider for Provider {
             },
         );
 
+        let pb_taints: Vec<Taint> = taint_tuples
+            .into_iter()
+            .map(|t| Taint {
+                key: Some(t.key),
+                value: t.value,
+                effect: Some(t.effect),
+                ..Default::default()
+            })
+            .collect();
+
         let node = Node {
             metadata: Some(ObjectMeta {
                 name: Some(format!("template-{asg_name}")),
                 labels,
+                annotations: if annotations.is_empty() {
+                    Default::default()
+                } else {
+                    annotations
+                },
                 ..Default::default()
             }),
             spec: Some(NodeSpec {
                 provider_id: Some(format!("{}:///template", binarylane::PROVIDER_NAME)),
-                taints: vec![Taint {
-                    key: Some("node.cloudprovider.kubernetes.io/uninitialized".to_string()),
-                    value: Some("true".to_string()),
-                    effect: Some("NoSchedule".to_string()),
-                    ..Default::default()
-                }],
+                taints: pb_taints,
                 ..Default::default()
             }),
             status: Some(NodeStatus {
@@ -765,4 +960,210 @@ fn chrono_like_timestamp() -> String {
         .unwrap_or_default();
     // Millisecond granularity avoids name collisions from rapid successive calls
     format!("{}", dur.as_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use binarylane_controller::crd::{NodeTaint, NodeTemplate, NodeTemplateMeta, NodeTemplateSpec};
+
+    fn base_spec() -> AutoScalingGroupSpec {
+        AutoScalingGroupSpec {
+            min_size: 0,
+            max_size: 5,
+            size: "std-2".into(),
+            region: "syd".into(),
+            image: "ubuntu-22.04".into(),
+            vcpus: None,
+            memory_mb: None,
+            disk_gb: None,
+            name_prefix: String::new(),
+            password_secret_ref: None,
+            user_data: None,
+            template_variables: Vec::new(),
+            template: None,
+        }
+    }
+
+    #[test]
+    fn controller_labels_and_taints_default() {
+        let attrs = Provider::build_node_labels_and_taints("workers", &base_spec());
+        assert_eq!(
+            attrs.labels.get(controllers::LABEL_ASG).map(String::as_str),
+            Some("workers"),
+        );
+        assert_eq!(
+            attrs
+                .labels
+                .get(controllers::LABEL_SIZE)
+                .map(String::as_str),
+            Some("std-2"),
+        );
+        assert_eq!(
+            attrs
+                .labels
+                .get(controllers::LABEL_REGION)
+                .map(String::as_str),
+            Some("syd"),
+        );
+        assert_eq!(
+            attrs
+                .labels
+                .get(controllers::LABEL_IMAGE)
+                .map(String::as_str),
+            Some("ubuntu-22.04"),
+        );
+        assert_eq!(
+            attrs.labels.get("kubernetes.io/arch").map(String::as_str),
+            Some("amd64"),
+        );
+        assert_eq!(attrs.taints.len(), 1);
+        assert_eq!(attrs.taints[0].key, controllers::UNINITIALIZED_TAINT);
+        assert!(attrs.annotations.is_empty());
+        assert!(attrs.dropped.is_empty());
+    }
+
+    #[test]
+    fn user_labels_annotations_taints_merged() {
+        let mut user_labels = BTreeMap::new();
+        user_labels.insert("role".into(), "gpu-worker".into());
+        let mut user_annotations = BTreeMap::new();
+        user_annotations.insert("company.io/team".into(), "infra".into());
+
+        let mut spec = base_spec();
+        spec.template = Some(NodeTemplate {
+            metadata: Some(NodeTemplateMeta {
+                labels: Some(user_labels),
+                annotations: Some(user_annotations),
+            }),
+            spec: Some(NodeTemplateSpec {
+                taints: Some(vec![NodeTaint {
+                    key: "gpu".into(),
+                    value: Some("true".into()),
+                    effect: "NoSchedule".into(),
+                }]),
+            }),
+        });
+
+        let attrs = Provider::build_node_labels_and_taints("workers", &spec);
+        assert_eq!(
+            attrs.labels.get("role").map(String::as_str),
+            Some("gpu-worker")
+        );
+        assert_eq!(
+            attrs.annotations.get("company.io/team").map(String::as_str),
+            Some("infra"),
+        );
+        assert_eq!(attrs.taints.len(), 2);
+        assert!(attrs.taints.iter().any(|t| t.key == "gpu"));
+        assert!(attrs.dropped.is_empty());
+    }
+
+    #[test]
+    fn reserved_label_collision_dropped() {
+        let mut user_labels = BTreeMap::new();
+        user_labels.insert("kubernetes.io/hostname".into(), "pwned".into());
+        user_labels.insert(controllers::LABEL_SIZE.into(), "tampered".into());
+        user_labels.insert("role".into(), "kept".into());
+
+        let mut spec = base_spec();
+        spec.template = Some(NodeTemplate {
+            metadata: Some(NodeTemplateMeta {
+                labels: Some(user_labels),
+                annotations: None,
+            }),
+            spec: None,
+        });
+
+        let attrs = Provider::build_node_labels_and_taints("workers", &spec);
+        // Controller value preserved
+        assert_eq!(
+            attrs
+                .labels
+                .get(controllers::LABEL_SIZE)
+                .map(String::as_str),
+            Some("std-2"),
+        );
+        // Non-reserved key still makes it through
+        assert_eq!(attrs.labels.get("role").map(String::as_str), Some("kept"));
+        // Dropped list mentions both reserved keys
+        assert!(
+            attrs
+                .dropped
+                .iter()
+                .any(|d| d == "label:kubernetes.io/hostname")
+        );
+        assert!(
+            attrs
+                .dropped
+                .iter()
+                .any(|d| *d == format!("label:{}", controllers::LABEL_SIZE)),
+        );
+    }
+
+    #[test]
+    fn server_id_label_is_reserved() {
+        // Regression: node_provision treats a Node with LABEL_SERVER_ID as
+        // already provisioned and exits early. A user sneaking this label
+        // into spec.template would leave the Node permanently stuck.
+        let mut user_labels = BTreeMap::new();
+        user_labels.insert(controllers::LABEL_SERVER_ID.into(), "999".into());
+
+        let mut spec = base_spec();
+        spec.template = Some(NodeTemplate {
+            metadata: Some(NodeTemplateMeta {
+                labels: Some(user_labels),
+                annotations: None,
+            }),
+            spec: None,
+        });
+
+        let attrs = Provider::build_node_labels_and_taints("workers", &spec);
+        assert!(!attrs.labels.contains_key(controllers::LABEL_SERVER_ID));
+        assert!(
+            attrs
+                .dropped
+                .iter()
+                .any(|d| *d == format!("label:{}", controllers::LABEL_SERVER_ID)),
+        );
+    }
+
+    #[test]
+    fn reserved_taint_collision_dropped() {
+        let mut spec = base_spec();
+        spec.template = Some(NodeTemplate {
+            metadata: None,
+            spec: Some(NodeTemplateSpec {
+                taints: Some(vec![
+                    NodeTaint {
+                        key: controllers::UNINITIALIZED_TAINT.into(),
+                        value: Some("no".into()),
+                        effect: "NoSchedule".into(),
+                    },
+                    NodeTaint {
+                        key: "gpu".into(),
+                        value: Some("true".into()),
+                        effect: "NoSchedule".into(),
+                    },
+                ]),
+            }),
+        });
+
+        let attrs = Provider::build_node_labels_and_taints("workers", &spec);
+        // Only the default uninitialized taint plus the user's gpu taint remain
+        assert_eq!(attrs.taints.len(), 2);
+        let uninit = attrs
+            .taints
+            .iter()
+            .find(|t| t.key == controllers::UNINITIALIZED_TAINT)
+            .unwrap();
+        // User override was dropped; value stays "true" (our controller value)
+        assert_eq!(uninit.value.as_deref(), Some("true"));
+        assert!(
+            attrs
+                .dropped
+                .iter()
+                .any(|d| d == &format!("taint:{}", controllers::UNINITIALIZED_TAINT)),
+        );
+    }
 }

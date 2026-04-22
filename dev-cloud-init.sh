@@ -16,6 +16,6 @@ if ! command -v curl >/dev/null 2>&1; then
   fi
 fi
 if ! command -v k3s >/dev/null 2>&1; then
-  curl -sfL https://get.k3s.io | ${SUDO} env K3S_URL="{{.K3S_URL}}" K3S_TOKEN="{{.K3S_TOKEN}}" INSTALL_K3S_EXEC="agent --node-name {{.NodeName}} --node-label autoscale-group={{.NodeGroup}}" sh -s -
+  curl -sfL https://get.k3s.io | ${SUDO} env K3S_URL="{{ k3sUrl }}" K3S_TOKEN="{{ k3sToken }}" INSTALL_K3S_EXEC="agent --node-name {{ node.name }} --node-label autoscale-group={{ asg.name }}" sh -s -
 fi
 ${SUDO} systemctl enable --now k3s-agent >/dev/null 2>&1 || true
