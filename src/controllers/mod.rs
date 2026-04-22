@@ -28,8 +28,15 @@ pub const ANNOTATION_ADOPT: &str = "bl.samcday.com/adopt";
 
 /// Labels set by the controller on every provisioned Node. User values from
 /// `spec.template.metadata.labels` that collide with these keys are dropped.
+///
+/// `LABEL_SERVER_ID` is reserved even though the autoscaler doesn't set it at
+/// Node creation — it's written by `node_provision` once the BinaryLane server
+/// is created, and `node_provision::reconcile` treats its presence as "already
+/// provisioned" and skips server creation entirely. A user-supplied value here
+/// would leave the Node permanently uninitialized.
 pub const RESERVED_LABELS: &[&str] = &[
     LABEL_ASG,
+    LABEL_SERVER_ID,
     LABEL_SIZE,
     LABEL_REGION,
     LABEL_IMAGE,

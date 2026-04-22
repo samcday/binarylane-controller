@@ -1102,6 +1102,33 @@ mod tests {
     }
 
     #[test]
+    fn server_id_label_is_reserved() {
+        // Regression: node_provision treats a Node with LABEL_SERVER_ID as
+        // already provisioned and exits early. A user sneaking this label
+        // into spec.template would leave the Node permanently stuck.
+        let mut user_labels = BTreeMap::new();
+        user_labels.insert(controllers::LABEL_SERVER_ID.into(), "999".into());
+
+        let mut spec = base_spec();
+        spec.template = Some(NodeTemplate {
+            metadata: Some(NodeTemplateMeta {
+                labels: Some(user_labels),
+                annotations: None,
+            }),
+            spec: None,
+        });
+
+        let attrs = Provider::build_node_labels_and_taints("workers", &spec);
+        assert!(!attrs.labels.contains_key(controllers::LABEL_SERVER_ID));
+        assert!(
+            attrs
+                .dropped
+                .iter()
+                .any(|d| *d == format!("label:{}", controllers::LABEL_SERVER_ID)),
+        );
+    }
+
+    #[test]
     fn reserved_taint_collision_dropped() {
         let mut spec = base_spec();
         spec.template = Some(NodeTemplate {
